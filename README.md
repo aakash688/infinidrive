@@ -2,10 +2,27 @@
 
 **InfiniDrive** is a decentralized cloud storage platform powered by Telegram's unlimited storage. Store unlimited files using your own Telegram bots as storage backends.
 
+## 🌐 Live Demo
+
+- **Web Panel**: [https://infinidrive-web.pages.dev](https://infinidrive-web.pages.dev)
+- **API Documentation**: [https://infinidrive-web.pages.dev/api](https://infinidrive-web.pages.dev/api)
+- **Backend API**: [https://infinidrive-backend.infinidrive.workers.dev](https://infinidrive-backend.infinidrive.workers.dev)
+
 ![InfiniDrive](https://img.shields.io/badge/InfiniDrive-Unlimited%20Storage-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue)
 ![SolidJS](https://img.shields.io/badge/SolidJS-1.8-2c4f7c)
+![Website](https://img.shields.io/badge/Website-Live-brightgreen)
+![Status](https://img.shields.io/badge/Status-Active-success)
+
+## 🔗 Project Links
+
+- 🌐 **Live Web App**: [https://infinidrive-web.pages.dev](https://infinidrive-web.pages.dev)
+- 📖 **API Documentation**: [https://infinidrive-web.pages.dev/api](https://infinidrive-web.pages.dev/api)
+- 🔧 **Backend API**: [https://infinidrive-backend.infinidrive.workers.dev](https://infinidrive-backend.infinidrive.workers.dev)
+- 📦 **GitHub Repository**: [https://github.com/aakash688/infinidrive](https://github.com/aakash688/infinidrive)
+
+> 💡 **For GitHub About Section**: Use the web app URL as the website link: `https://infinidrive-web.pages.dev`
 
 ## 🌟 Features
 

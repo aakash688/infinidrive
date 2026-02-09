@@ -1,0 +1,21 @@
+name = "infinidrive-backend"
+main = "src/index.ts"
+compatibility_date = "2024-01-15"
+
+[env.production]
+name = "infinidrive-backend"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "infinidrive-db"
+database_id = "6cb97e33-f9f2-4218-bc94-c8bb96a3e2d0"
+
+# Note: Cloudflare Cache API is accessed via caches.default in Workers runtime
+# No explicit binding is needed
+
+[vars]
+# Telegram Bot API base URL
+TELEGRAM_API_URL = "https://api.telegram.org/bot"
+# Secrets (set via wrangler secret put <NAME>):
+#   JWT_SECRET - For JWT signing (REQUIRED)
+#   TELEGRAM_BOT_TOKEN - For secure Telegram Login verification (OPTIONAL - users add their own storage bots via web panel)

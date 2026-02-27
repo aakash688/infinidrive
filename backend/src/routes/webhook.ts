@@ -448,21 +448,123 @@ app.post('/:bot_id', async (c) => {
             sourceInfo, now, now
           ).run();
 
-          // Create chunk record (single chunk - file already exists in Telegram)
-          const chunk_id = `chunk_${file_id}_0`;
-          const channel_id = bot.channel_id || message.chat?.id?.toString() || '';
+          // ==========================================
+          // FAIL-PROOF: Download and re-upload as chunks
+          // This ensures we have our own copy that won't be deleted
+          // ==========================================
+          const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB chunks
+          const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
+          
+          // Get storage channel (must be configured)
+          const storageChannelId = bot.channel_id;
+          if (!storageChannelId) {
+            throw new Error('Bot storage channel not configured. Please configure a channel in Settings.');
+          }
 
+          // Download file from Telegram
+          console.log(`[webhook] Downloading file from Telegram: ${fileInfo.file_name} (${fileInfo.file_size} bytes)`);
+          const { downloadFile, sendDocument } = await import('../services/telegram');
+          
+          let fileData: ArrayBuffer;
+          try {
+            fileData = await downloadFile(bot.bot_token_enc, fileInfo.file_id);
+            console.log(`[webhook] Downloaded ${fileData.byteLength} bytes from Telegram`);
+          } catch (downloadError) {
+            console.error(`[webhook] Failed to download file:`, downloadError);
+            
+            // Log failure
+            const log_id = `wlog_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+            await c.env.DB.prepare(`
+              INSERT INTO webhook_logs (log_id, bot_id, user_id, telegram_file_id, sender_id, sender_username, sender_name, chat_id, chat_title, file_name, file_size, mime_type, caption, status, error_message, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?)
+            `).bind(
+              log_id, bot_id, bot.user_id, fileInfo.file_id,
+              message.from?.id || null, message.from?.username || null, message.from?.first_name || null,
+              message.chat?.id?.toString() || null, message.chat?.title || null,
+              finalFileName, fileInfo.file_size, fileInfo.mime_type,
+              message.caption || null,
+              downloadError instanceof Error ? downloadError.message : 'Failed to download file',
+              now
+            ).run();
+
+            throw downloadError;
+          }
+
+          // Update file record with correct chunk count
           await c.env.DB.prepare(`
-            INSERT INTO chunks (
-              chunk_id, file_id, chunk_index, chunk_size, chunk_hash,
-              bot_id, telegram_message_id, telegram_file_id, channel_id, created_at
-            ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
-          `).bind(
-            chunk_id, file_id, fileInfo.file_size,
-            fileInfo.file_unique_id, bot_id,
-            message.message_id, fileInfo.file_id,
-            channel_id, now
-          ).run();
+            UPDATE files SET chunk_count = ? WHERE file_id = ?
+          `).bind(chunk_count, file_id).run();
+
+          // Split into chunks and upload to our storage channel
+          const fileArray = new Uint8Array(fileData);
+          const uploadedChunks: Array<{ chunk_index: number; message_id: number; file_id: string }> = [];
+
+          for (let chunkIndex = 0; chunkIndex < chunk_count; chunkIndex++) {
+            const start = chunkIndex * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, fileArray.length);
+            const chunkData = fileArray.slice(start, end);
+
+            try {
+              // Upload chunk to our storage channel
+              const chunkFileName = `chunk_${file_id}_${chunkIndex}.bin`;
+              const uploadResult = await sendDocument(
+                bot.bot_token_enc,
+                storageChannelId,
+                chunkData.buffer,
+                chunkFileName
+              );
+
+              uploadedChunks.push({
+                chunk_index: chunkIndex,
+                message_id: uploadResult.message_id,
+                file_id: uploadResult.file_id,
+              });
+
+              // Calculate hash for chunk (simple hash for now)
+              const chunkHash = `${fileInfo.file_unique_id}_${chunkIndex}`;
+
+              // Save chunk record
+              const chunk_id = `chunk_${file_id}_${chunkIndex}`;
+              await c.env.DB.prepare(`
+                INSERT INTO chunks (
+                  chunk_id, file_id, chunk_index, chunk_size, chunk_hash,
+                  bot_id, telegram_message_id, telegram_file_id, channel_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).bind(
+                chunk_id, file_id, chunkIndex, chunkData.length,
+                chunkHash, bot_id,
+                uploadResult.message_id, uploadResult.file_id,
+                storageChannelId, now
+              ).run();
+
+              console.log(`[webhook] Uploaded chunk ${chunkIndex + 1}/${chunk_count} (${chunkData.length} bytes)`);
+            } catch (chunkError) {
+              console.error(`[webhook] Failed to upload chunk ${chunkIndex}:`, chunkError);
+              
+              // Clean up uploaded chunks on failure
+              for (const uploaded of uploadedChunks) {
+                try {
+                  await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/deleteMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: storageChannelId,
+                      message_id: uploaded.message_id,
+                    }),
+                  });
+                } catch (cleanupError) {
+                  console.warn(`[webhook] Failed to cleanup chunk ${uploaded.chunk_index}:`, cleanupError);
+                }
+              }
+
+              // Delete file record
+              await c.env.DB.prepare(`DELETE FROM files WHERE file_id = ?`).bind(file_id).run();
+
+              throw new Error(`Failed to upload chunk ${chunkIndex}: ${chunkError instanceof Error ? chunkError.message : 'Unknown error'}`);
+            }
+          }
+
+          console.log(`[webhook] Successfully uploaded all ${chunk_count} chunks to storage channel`);
 
           // Log success
           const log_id = `wlog_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;

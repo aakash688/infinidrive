@@ -375,6 +375,46 @@ class ApiClient {
   async revokeApiKey(key_id: string) {
     return this.request(`/api/keys/${key_id}`, { method: 'DELETE' });
   }
+
+  // Cleanup
+  async getCleanupStats() {
+    return this.request<{
+      orphaned_chunks: number;
+      total_chunks: number;
+      deleted_files: number;
+      orphaned_percentage: string;
+    }>('/api/cleanup/stats');
+  }
+
+  async getOrphanedChunks(limit?: number) {
+    const query = limit ? `?limit=${limit}` : '';
+    return this.request<{ orphaned_chunks: any[]; total: number }>(`/api/cleanup/orphaned-chunks${query}`);
+  }
+
+  async deleteOrphanedChunks(options?: { dry_run?: boolean; limit?: number }) {
+    return this.request<{
+      total_found: number;
+      deleted: number;
+      failed: number;
+      errors: string[];
+      message: string;
+    }>('/api/cleanup/delete-orphaned-chunks', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: false, limit: 100, ...options }),
+    });
+  }
+
+  async deleteFileChunks(file_id: string) {
+    return this.request<{
+      total: number;
+      deleted: number;
+      failed: number;
+      errors: string[];
+      message: string;
+    }>(`/api/cleanup/delete-file-chunks/${file_id}`, {
+      method: 'POST',
+    });
+  }
 }
 
 export const api = new ApiClient(API_BASE);

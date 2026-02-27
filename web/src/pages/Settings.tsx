@@ -16,17 +16,22 @@ export default function Settings() {
   const [configuringBot, setConfiguringBot] = createSignal<string | null>(null);
   const [webhookLogs, setWebhookLogs] = createSignal<any[]>([]);
   const [showLogs, setShowLogs] = createSignal<string | null>(null);
+  const [cleanupStats, setCleanupStats] = createSignal<any>(null);
+  const [cleaningUp, setCleaningUp] = createSignal(false);
+  const [showCleanup, setShowCleanup] = createSignal(false);
 
   const loadData = async () => {
     try {
-      const [botsRes, devicesRes, foldersRes] = await Promise.all([
+      const [botsRes, devicesRes, foldersRes, statsRes] = await Promise.all([
         api.listBots(),
         api.listDevices(),
         api.getFolderTree().catch(() => ({ tree: [] })),
+        api.getCleanupStats().catch(() => null),
       ]);
       setBots(botsRes.bots);
       setDevices(devicesRes.devices);
       setFolders(flattenFolderTree(foldersRes.tree));
+      if (statsRes) setCleanupStats(statsRes);
     } catch (err) {
       console.error('Failed to load settings:', err);
     }
@@ -155,6 +160,33 @@ export default function Settings() {
 
   const formatTime = (ts: number): string => {
     return new Date(ts * 1000).toLocaleString();
+  };
+
+  const runCleanup = async (dryRun: boolean = false) => {
+    if (!confirm(dryRun 
+      ? 'This will show orphaned chunks without deleting them. Continue?'
+      : 'This will permanently delete orphaned chunks from Telegram channels. This cannot be undone. Continue?'
+    )) {
+      return;
+    }
+
+    setCleaningUp(true);
+    try {
+      const result = await api.deleteOrphanedChunks({ dry_run: dryRun, limit: 1000 });
+      if (dryRun) {
+        showNotification(`Found ${result.total_found} orphaned chunks. Run cleanup to delete them.`, 'info');
+      } else {
+        showNotification(
+          `Cleanup complete! Deleted ${result.deleted} chunks, ${result.failed} failed.`,
+          result.failed === 0 ? 'success' : 'error'
+        );
+        await loadData(); // Reload stats
+      }
+    } catch (err) {
+      showNotification(err instanceof Error ? err.message : 'Cleanup failed', 'error');
+    } finally {
+      setCleaningUp(false);
+    }
   };
 
   return (
@@ -850,6 +882,134 @@ export default function Settings() {
               )}
             </For>
           </div>
+        </div>
+
+        {/* Cleanup Section */}
+        <div style={{
+          background: 'white',
+          padding: '28px',
+          'border-radius': '12px',
+          'box-shadow': '0 2px 12px rgba(0,0,0,0.08)',
+          border: '1px solid #e8e8e8',
+        }}>
+          <div style={{ display: 'flex', 'justify-content': 'space-between', 'align-items': 'center', 'margin-bottom': '20px' }}>
+            <div>
+              <h2 style={{ margin: '0', 'font-size': '20px', color: '#1a1a2e' }}>Storage Cleanup</h2>
+              <p style={{ margin: '5px 0 0', color: '#666', 'font-size': '13px' }}>
+                Remove orphaned chunks from Telegram channels for deleted files
+              </p>
+            </div>
+            <button
+              onClick={() => setShowCleanup(!showCleanup())}
+              style={{
+                padding: '10px 20px',
+                background: showCleanup() ? '#f0f0f0' : '#4338ca',
+                color: showCleanup() ? '#333' : 'white',
+                border: 'none',
+                'border-radius': '8px',
+                cursor: 'pointer',
+                'font-weight': '600',
+                'font-size': '14px',
+              }}
+            >
+              {showCleanup() ? 'Hide' : 'Show Cleanup'}
+            </button>
+          </div>
+
+          <Show when={showCleanup()}>
+            <Show when={cleanupStats()}>
+              <div style={{
+                padding: '20px',
+                background: 'linear-gradient(135deg, #f0f4ff, #f8f9ff)',
+                'border-radius': '10px',
+                'margin-bottom': '20px',
+                border: '1px solid #e0e7ff',
+              }}>
+                <div style={{ display: 'grid', 'grid-template-columns': 'repeat(auto-fit, minmax(150px, 1fr))', gap: '16px' }}>
+                  <div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#4338ca' }}>
+                      {cleanupStats()?.orphaned_chunks || 0}
+                    </div>
+                    <div style={{ 'font-size': '12px', color: '#666', 'margin-top': '4px' }}>
+                      Orphaned Chunks
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#1a1a2e' }}>
+                      {cleanupStats()?.total_chunks || 0}
+                    </div>
+                    <div style={{ 'font-size': '12px', color: '#666', 'margin-top': '4px' }}>
+                      Total Chunks
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#dc2626' }}>
+                      {cleanupStats()?.deleted_files || 0}
+                    </div>
+                    <div style={{ 'font-size': '12px', color: '#666', 'margin-top': '4px' }}>
+                      Deleted Files
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#ef4444' }}>
+                      {cleanupStats()?.orphaned_percentage || '0'}%
+                    </div>
+                    <div style={{ 'font-size': '12px', color: '#666', 'margin-top': '4px' }}>
+                      Orphaned %
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </Show>
+
+            <div style={{
+              padding: '16px',
+              background: '#fef2f2',
+              'border-radius': '8px',
+              'margin-bottom': '16px',
+              border: '1px solid #fecaca',
+            }}>
+              <div style={{ 'font-size': '13px', color: '#991b1b', 'line-height': '1.6' }}>
+                <strong>⚠️ Important:</strong> This will permanently delete chunks from your Telegram storage channels.
+                These chunks belong to files that have been deleted from your File Manager. This action cannot be undone.
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button
+                onClick={() => runCleanup(true)}
+                disabled={cleaningUp()}
+                style={{
+                  padding: '12px 24px',
+                  background: '#f0f0f0',
+                  color: '#333',
+                  border: 'none',
+                  'border-radius': '8px',
+                  cursor: cleaningUp() ? 'not-allowed' : 'pointer',
+                  'font-weight': '600',
+                  'font-size': '14px',
+                }}
+              >
+                {cleaningUp() ? 'Scanning...' : '🔍 Scan for Orphaned Chunks'}
+              </button>
+              <button
+                onClick={() => runCleanup(false)}
+                disabled={cleaningUp() || !cleanupStats()?.orphaned_chunks}
+                style={{
+                  padding: '12px 24px',
+                  background: cleaningUp() || !cleanupStats()?.orphaned_chunks ? '#cbd5e1' : '#dc2626',
+                  color: 'white',
+                  border: 'none',
+                  'border-radius': '8px',
+                  cursor: cleaningUp() || !cleanupStats()?.orphaned_chunks ? 'not-allowed' : 'pointer',
+                  'font-weight': '600',
+                  'font-size': '14px',
+                }}
+              >
+                {cleaningUp() ? 'Cleaning...' : '🗑️ Delete Orphaned Chunks'}
+              </button>
+            </div>
+          </Show>
         </div>
       </div>
     </div>

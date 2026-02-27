@@ -82,7 +82,7 @@ app.get('/:share_id', optionalAuthMiddleware, async (c) => {
 
     const share = await c.env.DB.prepare(`
       SELECT 
-        share_id, file_id, user_id, expires_at, max_downloads,
+        share_id, file_id, user_id, password_hash, expires_at, max_downloads,
         download_count, is_active, created_at
       FROM shares
       WHERE share_id = ? AND is_active = 1
@@ -90,6 +90,7 @@ app.get('/:share_id', optionalAuthMiddleware, async (c) => {
       share_id: string;
       file_id: string;
       user_id: string;
+      password_hash: string | null;
       expires_at: number | null;
       max_downloads: number | null;
       download_count: number;
@@ -150,7 +151,7 @@ app.get('/:share_id', optionalAuthMiddleware, async (c) => {
         mime_type: file.mime_type,
         created_at: file.created_at,
       },
-      has_password: false, // Don't reveal if password exists
+      has_password: share.password_hash !== null && share.password_hash !== undefined,
       expires_at: share.expires_at,
       max_downloads: share.max_downloads,
       download_count: share.download_count,

@@ -341,7 +341,7 @@ app.get('/list', async (c) => {
       SELECT 
         file_id, file_name, file_path, file_size, mime_type,
         chunk_count, folder_id, is_public, public_title, public_category,
-        view_count, fork_count, created_at, updated_at
+        view_count, fork_count, source, source_info, created_at, updated_at
       FROM files
       WHERE user_id = ? AND is_deleted = 0
     `;
@@ -405,7 +405,7 @@ app.get('/list', async (c) => {
     }>();
 
     return c.json({
-      files: files.results.map(f => ({
+      files: files.results.map((f: any) => ({
         file_id: f.file_id,
         file_name: f.file_name,
         file_path: f.file_path,
@@ -418,6 +418,8 @@ app.get('/list', async (c) => {
         public_category: f.public_category,
         view_count: f.view_count,
         fork_count: f.fork_count,
+        source: f.source || 'upload',
+        source_info: f.source_info ? JSON.parse(f.source_info) : null,
         created_at: f.created_at,
         updated_at: f.updated_at,
       })),

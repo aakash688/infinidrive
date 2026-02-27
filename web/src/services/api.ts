@@ -146,6 +146,26 @@ class ApiClient {
     });
   }
 
+  async updateWebhookConfig(bot_id: string, config: {
+    is_enabled?: boolean;
+    target_folder_id?: string | null;
+    auto_categorize?: boolean;
+    capture_from_bot?: boolean;
+    capture_from_channel?: boolean;
+    allowed_types?: string;
+    max_file_size?: number;
+  }) {
+    return this.request(`/api/bots/${bot_id}/webhook-config`, {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    });
+  }
+
+  async getWebhookLogs(bot_id: string, params?: { limit?: number; offset?: number; status?: string }) {
+    const query = new URLSearchParams(params as any).toString();
+    return this.request<{ logs: any[]; total: number }>(`/api/bots/${bot_id}/webhook-logs?${query}`);
+  }
+
   // Devices
   async listDevices() {
     return this.request<{ devices: any[] }>('/api/devices/list');

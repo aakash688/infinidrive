@@ -233,7 +233,7 @@ export default function Files() {
         setMoveDialog({ item: null, type: 'file', show: false });
         setRenameDialog({ item: null, show: false, newName: '', type: 'file' });
         setShowCreateFolder(false);
-        setSelectedFiles(new Set());
+        setSelectedFiles(new Set<string>());
       }
     };
     document.addEventListener('keydown', handleKeydown);
@@ -246,7 +246,7 @@ export default function Files() {
   const navigateToFolder = async (folderId: string | null, folderName?: string) => {
     setCurrentFolderId(folderId);
     setSearchQuery('');
-    setSelectedFiles(new Set());
+    setSelectedFiles(new Set<string>());
     await buildBreadcrumb(folderId);
     await loadData(folderId);
   };
@@ -411,9 +411,9 @@ export default function Files() {
 
   const selectAllFiles = () => {
     if (selectedFiles().size === files().length) {
-      setSelectedFiles(new Set());
+      setSelectedFiles(new Set<string>());
     } else {
-      setSelectedFiles(new Set(files().map(f => f.file_id)));
+      setSelectedFiles(new Set<string>(files().map(f => f.file_id)));
     }
   };
 
@@ -424,7 +424,7 @@ export default function Files() {
     for (const fileId of selected) {
       try { await api.deleteFile(fileId); } catch {}
     }
-    setSelectedFiles(new Set());
+    setSelectedFiles(new Set<string>());
     addToast(`${selected.size} file(s) deleted`, 'success');
     await loadData(currentFolderId());
   };
@@ -1193,7 +1193,10 @@ export default function Files() {
                             <span>{formatBytes(file.file_size)}</span>
                             <span>{formatDate(file.created_at)}</span>
                           </div>
-                          {file.is_public && <span class="fm-badge fm-badge-success" style={{ 'margin-top': '6px' }}>Public</span>}
+                          <div style={{ display: 'flex', gap: '4px', 'margin-top': '6px', 'flex-wrap': 'wrap' }}>
+                            {file.is_public && <span class="fm-badge fm-badge-success">Public</span>}
+                            {file.source === 'webhook' && <span class="fm-badge" style={{ background: '#dbeafe', color: '#1d4ed8', 'font-size': '10px', padding: '2px 6px', 'border-radius': '8px' }}>Auto-captured</span>}
+                          </div>
                         </div>
                       )}
                     </For>

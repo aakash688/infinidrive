@@ -9,6 +9,8 @@ export default function SharedFile() {
   const [error, setError] = createSignal<string | null>(null);
   const [password, setPassword] = createSignal('');
   const [needsPassword, setNeedsPassword] = createSignal(false);
+  const [passwordError, setPasswordError] = createSignal<string | null>(null);
+  const [passwordVerified, setPasswordVerified] = createSignal(false);
 
   onMount(async () => {
     try {
@@ -16,6 +18,9 @@ export default function SharedFile() {
       setShare(data);
       if (data.has_password) {
         setNeedsPassword(true);
+        setPasswordVerified(false);
+      } else {
+        setPasswordVerified(true);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load share');
@@ -23,6 +28,65 @@ export default function SharedFile() {
       setLoading(false);
     }
   });
+
+  const verifyPassword = async () => {
+    if (!password().trim()) {
+      setPasswordError('Password is required');
+      return false;
+    }
+
+    try {
+      // Try to access the file with the password to verify it (use a small range request)
+      const testUrl = api.getShareStreamUrl(params.share_id, password());
+      const response = await fetch(testUrl, { 
+        method: 'GET',
+        headers: { 'Range': 'bytes=0-0' }
+      });
+      
+      if (response.ok || response.status === 206) {
+        setPasswordError(null);
+        setPasswordVerified(true);
+        return true;
+      } else if (response.status === 401) {
+        const errorData = await response.json().catch(() => ({ error: 'Invalid password' }));
+        setPasswordError(errorData.error || 'Invalid password');
+        setPasswordVerified(false);
+        return false;
+      } else {
+        // If it's not 401, the password might be correct but there's another issue
+        // For now, assume it's correct if we get past the password check
+        setPasswordError(null);
+        setPasswordVerified(true);
+        return true;
+      }
+    } catch (err) {
+      setPasswordError('Failed to verify password. Please try again.');
+      setPasswordVerified(false);
+      return false;
+    }
+  };
+
+  const handleDownload = async (e: MouseEvent) => {
+    e.preventDefault();
+    
+    if (needsPassword() && !passwordVerified()) {
+      const verified = await verifyPassword();
+      if (!verified) return;
+    }
+    
+    window.location.href = api.getShareDownloadUrl(params.share_id, password() || undefined);
+  };
+
+  const handleStream = async (e: MouseEvent) => {
+    e.preventDefault();
+    
+    if (needsPassword() && !passwordVerified()) {
+      const verified = await verifyPassword();
+      if (!verified) return;
+    }
+    
+    window.open(api.getShareStreamUrl(params.share_id, password() || undefined), '_blank');
+  };
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 B';
@@ -117,25 +181,25 @@ export default function SharedFile() {
             </div>
 
             {/* Inline Video/Audio Player */}
-            <Show when={isStreamable() && !needsPassword()}>
+            <Show when={isStreamable() && (!needsPassword() || passwordVerified())}>
               <div style={{ 'margin-bottom': '20px' }}>
                 <Show when={share()?.file?.mime_type?.startsWith('video/')}>
                   <video
                     controls
                     style={{ width: '100%', 'max-height': '400px', 'border-radius': '8px', background: '#000' }}
-                    src={api.getShareStreamUrl(params.share_id)}
+                    src={api.getShareStreamUrl(params.share_id, password() || undefined)}
                   />
                 </Show>
                 <Show when={share()?.file?.mime_type?.startsWith('audio/')}>
                   <audio
                     controls
                     style={{ width: '100%' }}
-                    src={api.getShareStreamUrl(params.share_id)}
+                    src={api.getShareStreamUrl(params.share_id, password() || undefined)}
                   />
                 </Show>
                 <Show when={share()?.file?.mime_type?.startsWith('image/')}>
                   <img
-                    src={api.getShareStreamUrl(params.share_id)}
+                    src={api.getShareStreamUrl(params.share_id, password() || undefined)}
                     alt={share()?.file?.file_name}
                     style={{ width: '100%', 'max-height': '400px', 'object-fit': 'contain', 'border-radius': '8px' }}
                   />
@@ -144,7 +208,7 @@ export default function SharedFile() {
             </Show>
 
             {/* Password Field */}
-            <Show when={needsPassword()}>
+            <Show when={needsPassword() && !passwordVerified()}>
               <div style={{ 'margin-bottom': '20px' }}>
                 <label style={{ display: 'block', 'margin-bottom': '5px', 'font-weight': 'bold' }}>
                   This file is password protected
@@ -153,54 +217,108 @@ export default function SharedFile() {
                   type="password"
                   placeholder="Enter password"
                   value={password()}
-                  onInput={(e) => setPassword(e.currentTarget.value)}
+                  onInput={(e) => {
+                    setPassword(e.currentTarget.value);
+                    setPasswordError(null);
+                  }}
+                  onKeyPress={(e) => {
+                    if (e.key === 'Enter') verifyPassword();
+                  }}
                   style={{
                     width: '100%',
                     padding: '12px',
-                    border: '1px solid #ddd',
+                    border: passwordError() ? '2px solid #dc3545' : '1px solid #ddd',
                     'border-radius': '8px',
                     'box-sizing': 'border-box',
                   }}
                 />
+                {passwordError() && (
+                  <div style={{ 
+                    color: '#dc3545', 
+                    'font-size': '13px', 
+                    'margin-top': '6px',
+                    display: 'flex',
+                    'align-items': 'center',
+                    gap: '6px'
+                  }}>
+                    ⚠️ {passwordError()}
+                  </div>
+                )}
+                <button
+                  onClick={verifyPassword}
+                  style={{
+                    width: '100%',
+                    padding: '10px',
+                    background: '#007bff',
+                    color: 'white',
+                    border: 'none',
+                    'border-radius': '6px',
+                    cursor: 'pointer',
+                    'font-weight': '600',
+                    'margin-top': '10px',
+                  }}
+                >
+                  🔓 Verify Password
+                </button>
+              </div>
+            </Show>
+            
+            <Show when={needsPassword() && passwordVerified()}>
+              <div style={{ 
+                padding: '12px', 
+                background: '#d4edda', 
+                color: '#155724',
+                'border-radius': '8px',
+                'margin-bottom': '20px',
+                display: 'flex',
+                'align-items': 'center',
+                gap: '8px'
+              }}>
+                ✓ Password verified. You can now download or stream the file.
               </div>
             </Show>
 
             {/* Action Buttons */}
             <div style={{ display: 'flex', gap: '10px', 'flex-wrap': 'wrap' }}>
-              <a
-                href={api.getShareDownloadUrl(params.share_id, password() || undefined)}
+              <button
+                onClick={handleDownload}
+                disabled={needsPassword() && !passwordVerified()}
                 style={{
                   flex: 1,
                   padding: '12px 20px',
-                  background: '#007bff',
+                  background: needsPassword() && !passwordVerified() ? '#6c757d' : '#007bff',
                   color: 'white',
-                  'text-decoration': 'none',
+                  border: 'none',
                   'border-radius': '8px',
                   'text-align': 'center',
                   'font-weight': 'bold',
                   'min-width': '120px',
+                  cursor: needsPassword() && !passwordVerified() ? 'not-allowed' : 'pointer',
+                  opacity: needsPassword() && !passwordVerified() ? 0.6 : 1,
                 }}
               >
                 ⬇️ Download
-              </a>
+              </button>
               <Show when={isStreamable()}>
-                <a
-                  href={api.getShareStreamUrl(params.share_id, password() || undefined)}
-                  target="_blank"
+                <button
+                  onClick={handleStream}
+                  disabled={needsPassword() && !passwordVerified()}
                   style={{
                     flex: 1,
                     padding: '12px 20px',
-                    background: '#28a745',
+                    background: needsPassword() && !passwordVerified() ? '#6c757d' : '#28a745',
                     color: 'white',
-                    'text-decoration': 'none',
+                    border: 'none',
                     'border-radius': '8px',
                     'text-align': 'center',
                     'font-weight': 'bold',
                     'min-width': '120px',
+                    cursor: needsPassword() && !passwordVerified() ? 'not-allowed' : 'pointer',
+                    opacity: needsPassword() && !passwordVerified() ? 0.6 : 1,
                   }}
                 >
                   ▶️ Stream
-                </a>
+                </button>
               </Show>
               <Show when={api.token}>
                 <button

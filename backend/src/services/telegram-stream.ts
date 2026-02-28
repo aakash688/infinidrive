@@ -60,15 +60,43 @@ export async function streamDownloadFile(
   chunkSize: number,
   onChunk: (chunkIndex: number, chunkData: ArrayBuffer, start: number, end: number) => Promise<void>
 ): Promise<void> {
-  // First, get file path
-  const getFileResponse = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
-  const getFileData: any = await getFileResponse.json();
+  // First, get file path with retry
+  let getFileData: any = null;
+  let filePath: string | null = null;
   
-  if (!getFileData.ok || !getFileData.result.file_path) {
-    throw new Error('Failed to get file path from Telegram');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const getFileResponse = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`);
+      getFileData = await getFileResponse.json();
+      
+      if (getFileData.ok && getFileData.result?.file_path) {
+        filePath = getFileData.result.file_path;
+        break;
+      }
+      
+      // If we get an error response, log it
+      if (!getFileData.ok) {
+        console.warn(`[streamDownload] getFile attempt ${attempt} failed:`, getFileData);
+        if (attempt < 3) {
+          // Wait before retry (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+      }
+    } catch (error) {
+      console.error(`[streamDownload] getFile attempt ${attempt} error:`, error);
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+    }
   }
-
-  const filePath = getFileData.result.file_path;
+  
+  if (!filePath) {
+    // Provide detailed error message
+    const errorDetails = getFileData 
+      ? `Telegram API error: ${JSON.stringify(getFileData)}`
+      : 'Failed to get file path from Telegram (network error or file not accessible)';
+    throw new Error(errorDetails);
+  }
   const totalChunks = Math.ceil(fileSize / chunkSize);
   const url = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
 

@@ -593,7 +593,7 @@ app.post('/:bot_id', async (c) => {
               // This downloads chunks from Telegram and uploads them immediately
               // No intermediate storage required - works within Workers memory limits
               console.log(`[webhook] Starting streaming download/upload: ${fileInfo.file_name} (${fileInfo.file_size} bytes)`);
-              const { sendDocument } = await import('../services/telegram');
+              const { sendDocument, downloadFile } = await import('../services/telegram');
               const { streamDownloadFile } = await import('../services/telegram-stream');
               
               // Update status: Processing
@@ -620,13 +620,15 @@ app.post('/:bot_id', async (c) => {
               let completedChunks = 0;
               let failedChunks = 0;
 
-              // Stream download and upload chunks in parallel
-              await streamDownloadFile(
-                bot.bot_token_enc,
-                fileInfo.file_id,
-                fileInfo.file_size,
-                CHUNK_SIZE,
-                async (chunkIndex: number, chunkData: ArrayBuffer, start: number, end: number) => {
+              // Try streaming approach first, fallback to full download if it fails
+              try {
+                // Stream download and upload chunks in parallel
+                await streamDownloadFile(
+                  bot.bot_token_enc,
+                  fileInfo.file_id,
+                  fileInfo.file_size,
+                  CHUNK_SIZE,
+                  async (chunkIndex: number, chunkData: ArrayBuffer, start: number, end: number) => {
                   try {
                     // Select bot for this chunk (round-robin)
                     const selectedBot = availableBots[chunkIndex % availableBots.length];
@@ -731,11 +733,144 @@ app.post('/:bot_id', async (c) => {
                 }
               );
 
-              if (failedChunks > 0) {
-                throw new Error(`Failed to process ${failedChunks} chunks`);
-              }
+                if (failedChunks > 0) {
+                  throw new Error(`Failed to process ${failedChunks} chunks`);
+                }
 
-              console.log(`[webhook] Successfully processed all ${chunk_count} chunks using ${availableBots.length} bot(s) via streaming`)
+                console.log(`[webhook] Successfully processed all ${chunk_count} chunks using ${availableBots.length} bot(s) via streaming`);
+              } catch (streamError) {
+                // Fallback: If streaming fails (e.g., getFile doesn't work), use full download approach
+                console.warn(`[webhook] Streaming approach failed, falling back to full download:`, streamError);
+                
+                if (replyChatId && statusMessageId) {
+                  try {
+                    await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: replyChatId,
+                        message_id: statusMessageId,
+                        text: `⬆️ **Downloading full file...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Using fallback method (full download)...`,
+                        parse_mode: 'Markdown',
+                      }),
+                    });
+                  } catch (e) {}
+                }
+
+                // Download full file using original method
+                let fileData: ArrayBuffer;
+                try {
+                  fileData = await downloadFile(bot.bot_token_enc, fileInfo.file_id);
+                  console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
+                } catch (downloadError) {
+                  throw new Error(`Failed to download file: ${downloadError instanceof Error ? downloadError.message : 'Unknown error'}`);
+                }
+
+                // Update status: Uploading
+                if (replyChatId && statusMessageId) {
+                  try {
+                    await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        chat_id: replyChatId,
+                        message_id: statusMessageId,
+                        text: `⬆️ **Uploading to InfiniDrive...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n🤖 ${botInfo}\n\n📊 Chunks: 0/${chunk_count}\n⏳ Please wait...`,
+                        parse_mode: 'Markdown',
+                      }),
+                    });
+                  } catch (e) {}
+                }
+
+                // Split into chunks and upload in parallel
+                const fileArray = new Uint8Array(fileData);
+                const CONCURRENCY_LIMIT = 5;
+                const uploadPromises: Promise<void>[] = [];
+
+                const uploadChunk = async (chunkIndex: number) => {
+                  try {
+                    const start = chunkIndex * CHUNK_SIZE;
+                    const end = Math.min(start + CHUNK_SIZE, fileArray.length);
+                    const chunkData = fileArray.slice(start, end);
+
+                    const selectedBot = availableBots[chunkIndex % availableBots.length];
+                    const chunkFileName = `chunk_${file_id}_${chunkIndex}.bin`;
+                    const uploadResult = await sendDocument(
+                      selectedBot.bot_token_enc,
+                      selectedBot.channel_id,
+                      chunkData.buffer,
+                      chunkFileName
+                    );
+
+                    const chunkHash = `${fileInfo.file_unique_id}_${chunkIndex}`;
+                    const chunk_id = `chunk_${file_id}_${chunkIndex}`;
+                    await c.env.DB.prepare(`
+                      INSERT INTO chunks (
+                        chunk_id, file_id, chunk_index, chunk_size, chunk_hash,
+                        bot_id, telegram_message_id, telegram_file_id, channel_id, created_at
+                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `).bind(
+                      chunk_id, file_id, chunkIndex, chunkData.length,
+                      chunkHash, selectedBot.bot_id,
+                      uploadResult.message_id, uploadResult.file_id,
+                      selectedBot.channel_id, now
+                    ).run();
+
+                    uploadedChunks.push({
+                      chunk_index: chunkIndex,
+                      message_id: uploadResult.message_id,
+                      file_id: uploadResult.file_id,
+                      bot_id: selectedBot.bot_id,
+                    });
+
+                    completedChunks++;
+                    console.log(`[webhook] Uploaded chunk ${chunkIndex + 1}/${chunk_count} (${chunkData.length} bytes) via bot ${selectedBot.bot_id}`);
+
+                    // Update progress
+                    if (completedChunks % 5 === 0 || completedChunks === chunk_count) {
+                      if (replyChatId && statusMessageId) {
+                        const progress = Math.round((completedChunks / chunk_count) * 100);
+                        try {
+                          await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              chat_id: replyChatId,
+                              message_id: statusMessageId,
+                              text: `⬆️ **Uploading to InfiniDrive...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n🤖 ${botInfo}\n\n📊 Progress: ${completedChunks}/${chunk_count} chunks (${progress}%)\n⏳ Please wait...`,
+                              parse_mode: 'Markdown',
+                            }),
+                          });
+                        } catch (e) {}
+                      }
+                    }
+                  } catch (chunkError) {
+                    failedChunks++;
+                    console.error(`[webhook] Failed to upload chunk ${chunkIndex}:`, chunkError);
+                    throw chunkError;
+                  }
+                };
+
+                // Upload chunks in parallel
+                for (let chunkIndex = 0; chunkIndex < chunk_count; chunkIndex++) {
+                  uploadPromises.push(uploadChunk(chunkIndex));
+                  
+                  if (uploadPromises.length >= CONCURRENCY_LIMIT) {
+                    await Promise.all(uploadPromises);
+                    uploadPromises.length = 0;
+                  }
+                }
+
+                if (uploadPromises.length > 0) {
+                  await Promise.all(uploadPromises);
+                }
+
+                if (failedChunks > 0) {
+                  throw new Error(`Failed to upload ${failedChunks} chunks`);
+                }
+
+                console.log(`[webhook] Successfully uploaded all ${chunk_count} chunks using fallback method`);
+              }
 
               // Log success
               const log_id = `wlog_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;

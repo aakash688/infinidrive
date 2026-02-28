@@ -1031,6 +1031,10 @@ app.post('/:bot_id', async (c) => {
                 let actualFileId = fileInfo.file_id;
                 const isForwarded = !!(message.forward_from_chat || message.forward_origin);
                 
+                // IMPORTANT: If file is NOT forwarded (e.g., created by copyMessage), it should work fine
+                // Files without forward_from_chat/forward_origin have working file_ids
+                console.log(`[webhook] File forwarding status: ${isForwarded ? 'FORWARDED' : 'NOT FORWARDED (should work)'}`);
+                
                 try {
                   console.log(`[webhook] Starting full file download (${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB)...`);
                   
@@ -1111,22 +1115,29 @@ app.post('/:bot_id', async (c) => {
                   }
                   
                   // First, check if getFile will work (fail fast for large forwarded files)
-                  console.log(`[webhook] Checking if file can be downloaded (file_id: ${actualFileId.substring(0, 30)}...)`);
+                  // IMPORTANT: Files that are NOT forwarded (e.g., created by copyMessage) should work fine!
+                  console.log(`[webhook] Checking if file can be downloaded (file_id: ${actualFileId.substring(0, 30)}..., forwarded: ${isForwarded})`);
                   let canDownload = false;
                   try {
                     const { getFile } = await import('../services/telegram');
                     const testFile = await getFile(bot.bot_token_enc, actualFileId);
                     canDownload = !!testFile.file_path;
                     console.log(`[webhook] getFile check: ${canDownload ? 'OK' : 'FAILED'}, file_path: ${testFile.file_path || 'none'}`);
+                    
+                    if (canDownload && !isForwarded) {
+                      console.log(`[webhook] ✅ File is NOT forwarded - should download successfully!`);
+                    }
                   } catch (getFileError) {
                     const getFileErrorMsg = getFileError instanceof Error ? getFileError.message : String(getFileError);
                     console.warn(`[webhook] getFile check failed:`, getFileErrorMsg);
                     
                     // If "file is too big" error, fail immediately with helpful message
+                    // BUT: Only if file is forwarded. Non-forwarded files should work even if >20MB
                     if (getFileErrorMsg.includes('file is too big') || getFileErrorMsg.includes('too big') || getFileErrorMsg.includes('400')) {
                       if (isForwarded) {
                         throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. Use a file sharing service that supports direct links`);
                       } else {
+                        // Non-forwarded files >20MB might still work, but if getFile fails, show error
                         throw new Error(`File is too large (>20MB). Telegram API limitation. Please try sending the file in smaller parts or use the web panel to upload.`);
                       }
                     }
@@ -1134,8 +1145,15 @@ app.post('/:bot_id', async (c) => {
                     console.log(`[webhook] getFile failed but will try download anyway:`, getFileErrorMsg);
                   }
                   
+                  // Only block if file is forwarded AND >20MB AND getFile failed
+                  // Non-forwarded files should be allowed to proceed
                   if (!canDownload && isForwarded && fileInfo.file_size > 20 * 1024 * 1024) {
                     throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel`);
+                  }
+                  
+                  // If file is NOT forwarded, proceed even if getFile check failed (might be temporary issue)
+                  if (!canDownload && !isForwarded) {
+                    console.log(`[webhook] File is NOT forwarded - proceeding with download attempt despite getFile check failure`);
                   }
                   
                   // Update status every 10 seconds during download

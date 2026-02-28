@@ -178,6 +178,243 @@ app.post('/:bot_id', async (c) => {
     }
 
     // ==========================================
+    // HANDLE: Bot commands (text messages)
+    // ==========================================
+    if (update.message?.text && update.message.text.startsWith('/')) {
+      const command = update.message.text.split(' ')[0].toLowerCase();
+      const chatId = update.message.chat?.id;
+      const messageId = update.message.message_id;
+
+      if (!chatId) {
+        return c.json({ ok: true });
+      }
+
+      // Helper to send message
+      const sendMessage = async (text: string, parseMode: string = 'Markdown') => {
+        try {
+          await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text,
+              parse_mode: parseMode,
+              reply_to_message_id: messageId,
+            }),
+          });
+        } catch (e) {
+          console.error('[webhook] Failed to send command response:', e);
+        }
+      };
+
+      // /status - Get system overview
+      if (command === '/status' || command === '/stats') {
+        try {
+          const filesStats = await c.env.DB.prepare(`
+            SELECT 
+              COUNT(*) as total_files,
+              SUM(file_size) as total_size
+            FROM files
+            WHERE user_id = ? AND is_deleted = 0
+          `).bind(bot.user_id).first<{ total_files: number; total_size: number | null }>();
+
+          const activeBots = await c.env.DB.prepare(`
+            SELECT COUNT(*) as count
+            FROM bots
+            WHERE user_id = ? AND is_active = 1 AND health_status = 'healthy'
+          `).bind(bot.user_id).first<{ count: number }>();
+
+          const activeUploads = await c.env.DB.prepare(`
+            SELECT COUNT(DISTINCT f.file_id) as count
+            FROM files f
+            LEFT JOIN chunks c ON f.file_id = c.file_id
+            WHERE f.user_id = ? 
+              AND f.is_deleted = 0
+              AND f.created_at > unixepoch() - 1800
+            GROUP BY f.file_id
+            HAVING COUNT(c.chunk_id) < f.chunk_count
+          `).bind(bot.user_id).all();
+
+          const formatSize = (bytes: number | null) => {
+            if (!bytes) return '0 B';
+            if (bytes < 1024) return `${bytes} B`;
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+            if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+            return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+          };
+
+          const text = `📊 **InfiniDrive Status**\n\n` +
+            `📁 **Files:** ${filesStats?.total_files || 0}\n` +
+            `💾 **Storage:** ${formatSize(filesStats?.total_size || 0)}\n` +
+            `🤖 **Active Bots:** ${activeBots?.count || 0}\n` +
+            `⬆️ **Active Uploads:** ${activeUploads.results.length}\n\n` +
+            `_Use /help for more commands_`;
+
+          await sendMessage(text);
+        } catch (error) {
+          await sendMessage('❌ Failed to get status. Please try again.');
+        }
+        return c.json({ ok: true });
+      }
+
+      // /uploads - Get active uploads
+      if (command === '/uploads' || command === '/uploading') {
+        try {
+          const activeUploads = await c.env.DB.prepare(`
+            SELECT 
+              f.file_id, f.file_name, f.file_size, f.chunk_count,
+              COUNT(c.chunk_id) as uploaded_chunks,
+              f.created_at
+            FROM files f
+            LEFT JOIN chunks c ON f.file_id = c.file_id
+            WHERE f.user_id = ? 
+              AND f.is_deleted = 0
+              AND f.created_at > unixepoch() - 1800
+            GROUP BY f.file_id
+            HAVING uploaded_chunks < f.chunk_count
+            ORDER BY f.created_at DESC
+            LIMIT 10
+          `).bind(bot.user_id).all<{
+            file_id: string;
+            file_name: string;
+            file_size: number;
+            chunk_count: number;
+            uploaded_chunks: number;
+            created_at: number;
+          }>();
+
+          if (activeUploads.results.length === 0) {
+            await sendMessage('✅ No active uploads at the moment.');
+            return c.json({ ok: true });
+          }
+
+          const formatSize = (bytes: number) => {
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+            return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+          };
+
+          let text = `⬆️ **Active Uploads** (${activeUploads.results.length})\n\n`;
+          for (const upload of activeUploads.results) {
+            const progress = Math.round((upload.uploaded_chunks / upload.chunk_count) * 100);
+            const elapsed = Math.floor(Date.now() / 1000) - upload.created_at;
+            const uploadedSize = (upload.uploaded_chunks / upload.chunk_count) * upload.file_size;
+            const speed = elapsed > 0 ? uploadedSize / elapsed : 0;
+            const speedStr = speed > 1024 * 1024 
+              ? `${(speed / (1024 * 1024)).toFixed(2)} MB/s`
+              : `${(speed / 1024).toFixed(2)} KB/s`;
+
+            text += `📄 ${upload.file_name.substring(0, 30)}${upload.file_name.length > 30 ? '...' : ''}\n`;
+            text += `📦 ${formatSize(upload.file_size)} | ${progress}% (${upload.uploaded_chunks}/${upload.chunk_count})\n`;
+            text += `⚡ ${speedStr}\n\n`;
+          }
+
+          await sendMessage(text);
+        } catch (error) {
+          await sendMessage('❌ Failed to get uploads. Please try again.');
+        }
+        return c.json({ ok: true });
+      }
+
+      // /bots - Get bot status
+      if (command === '/bots') {
+        try {
+          const bots = await c.env.DB.prepare(`
+            SELECT 
+              bot_id, bot_username, bot_name, health_status,
+              channel_id, is_active,
+              (SELECT COUNT(*) FROM chunks WHERE bot_id = bots.bot_id) as chunks_count
+            FROM bots
+            WHERE user_id = ?
+            ORDER BY is_active DESC
+          `).bind(bot.user_id).all<{
+            bot_id: string;
+            bot_username: string | null;
+            bot_name: string | null;
+            health_status: string;
+            channel_id: string | null;
+            is_active: number;
+            chunks_count: number;
+          }>();
+
+          let text = `🤖 **Bots Status** (${bots.results.length})\n\n`;
+          for (const botInfo of bots.results) {
+            const status = botInfo.is_active === 1 
+              ? (botInfo.health_status === 'healthy' ? '✅' : '⚠️')
+              : '❌';
+            const name = botInfo.bot_username || botInfo.bot_name || botInfo.bot_id;
+            text += `${status} **${name}**\n`;
+            text += `   Health: ${botInfo.health_status}\n`;
+            text += `   Chunks: ${botInfo.chunks_count}\n`;
+            text += `   Channel: ${botInfo.channel_id ? '✅' : '❌'}\n\n`;
+          }
+
+          await sendMessage(text);
+        } catch (error) {
+          await sendMessage('❌ Failed to get bot status. Please try again.');
+        }
+        return c.json({ ok: true });
+      }
+
+      // /logs - Get recent logs
+      if (command === '/logs') {
+        try {
+          const logs = await c.env.DB.prepare(`
+            SELECT 
+              file_name, status, error_message, created_at
+            FROM webhook_logs
+            WHERE user_id = ? AND bot_id = ?
+            ORDER BY created_at DESC
+            LIMIT 10
+          `).bind(bot.user_id, bot_id).all<{
+            file_name: string | null;
+            status: string;
+            error_message: string | null;
+            created_at: number;
+          }>();
+
+          if (logs.results.length === 0) {
+            await sendMessage('📋 No recent logs.');
+            return c.json({ ok: true });
+          }
+
+          let text = `📋 **Recent Logs** (${logs.results.length})\n\n`;
+          for (const log of logs.results) {
+            const statusIcon = log.status === 'captured' ? '✅' : log.status === 'failed' ? '❌' : '⏭️';
+            const fileName = log.file_name || 'Unknown';
+            text += `${statusIcon} ${fileName.substring(0, 25)}${fileName.length > 25 ? '...' : ''}\n`;
+            if (log.error_message) {
+              text += `   ⚠️ ${log.error_message.substring(0, 40)}${log.error_message.length > 40 ? '...' : ''}\n`;
+            }
+            text += '\n';
+          }
+
+          await sendMessage(text);
+        } catch (error) {
+          await sendMessage('❌ Failed to get logs. Please try again.');
+        }
+        return c.json({ ok: true });
+      }
+
+      // /help - Show available commands
+      if (command === '/help' || command === '/start') {
+        const text = `🤖 **InfiniDrive Bot Commands**\n\n` +
+          `📊 /status - System overview\n` +
+          `⬆️ /uploads - Active uploads with progress\n` +
+          `🤖 /bots - Bot status and health\n` +
+          `📋 /logs - Recent webhook logs\n` +
+          `❓ /help - Show this help\n\n` +
+          `_Just send a file to upload it automatically!_`;
+
+        await sendMessage(text);
+        return c.json({ ok: true });
+      }
+
+      // Unknown command
+      await sendMessage('❓ Unknown command. Use /help for available commands.');
+      return c.json({ ok: true });
+    }
+
+    // ==========================================
     // HANDLE: Bot added to channel/group
     // ==========================================
     if (update.message?.new_chat_members) {

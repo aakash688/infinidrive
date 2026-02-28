@@ -15,6 +15,7 @@ import projectRoutes from './routes/projects';
 import apiKeyRoutes from './routes/apikeys';
 import v1Routes from './routes/v1';
 import cleanupRoutes from './routes/cleanup';
+import statusRoutes from './routes/status';
 
 type Env = {
   DB: D1Database;
@@ -55,6 +56,7 @@ app.route('/api/projects', projectRoutes);
 app.route('/api/keys', apiKeyRoutes);
 app.route('/api/v1', v1Routes);
 app.route('/api/cleanup', cleanupRoutes);
+app.route('/api/status', statusRoutes);
 
 // 404 handler
 app.notFound((c) => {

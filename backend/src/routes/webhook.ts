@@ -1092,6 +1092,34 @@ app.post('/:bot_id', async (c) => {
                     }
                   }
                   
+                  // First, check if getFile will work (fail fast for large forwarded files)
+                  console.log(`[webhook] Checking if file can be downloaded (file_id: ${actualFileId.substring(0, 30)}...)`);
+                  let canDownload = false;
+                  try {
+                    const { getFile } = await import('../services/telegram');
+                    const testFile = await getFile(bot.bot_token_enc, actualFileId);
+                    canDownload = !!testFile.file_path;
+                    console.log(`[webhook] getFile check: ${canDownload ? 'OK' : 'FAILED'}, file_path: ${testFile.file_path || 'none'}`);
+                  } catch (getFileError) {
+                    const getFileErrorMsg = getFileError instanceof Error ? getFileError.message : String(getFileError);
+                    console.warn(`[webhook] getFile check failed:`, getFileErrorMsg);
+                    
+                    // If "file is too big" error, fail immediately with helpful message
+                    if (getFileErrorMsg.includes('file is too big') || getFileErrorMsg.includes('too big') || getFileErrorMsg.includes('400')) {
+                      if (isForwarded) {
+                        throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. Use a file sharing service that supports direct links`);
+                      } else {
+                        throw new Error(`File is too large (>20MB). Telegram API limitation. Please try sending the file in smaller parts or use the web panel to upload.`);
+                      }
+                    }
+                    // For other errors, still try to download (might be temporary)
+                    console.log(`[webhook] getFile failed but will try download anyway:`, getFileErrorMsg);
+                  }
+                  
+                  if (!canDownload && isForwarded && fileInfo.file_size > 20 * 1024 * 1024) {
+                    throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel`);
+                  }
+                  
                   // Update status every 10 seconds during download
                   const progressInterval = setInterval(async () => {
                     if (replyChatId && statusMessageId) {

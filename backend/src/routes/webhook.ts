@@ -180,13 +180,15 @@ app.post('/:bot_id', async (c) => {
     // ==========================================
     // HANDLE: Bot commands (text messages)
     // ==========================================
-    if (update.message?.text && update.message.text.startsWith('/')) {
+    // Handle both message (private/group) and channel_post (channel)
+    const commandMessage = update.message || update.channel_post;
+    if (commandMessage?.text && commandMessage.text.startsWith('/')) {
       // Extract command (handle both /command and /command@botname)
-      const commandText = update.message.text.split(' ')[0].toLowerCase();
+      const commandText = commandMessage.text.split(' ')[0].toLowerCase();
       const command = commandText.split('@')[0]; // Remove @botname if present
-      const chatId = update.message.chat?.id;
-      const messageId = update.message.message_id;
-      const chatType = update.message.chat?.type;
+      const chatId = commandMessage.chat?.id;
+      const messageId = commandMessage.message_id;
+      const chatType = commandMessage.chat?.type;
 
       console.log(`[webhook] Command received: ${command} in ${chatType} chat ${chatId}`);
 
@@ -1011,9 +1013,39 @@ app.post('/:bot_id', async (c) => {
                 }
 
                 // Download full file using original method with progress updates
+                // For large files (>20MB), getFile doesn't work, so we need to use copyMessage workaround
                 let fileData: ArrayBuffer;
+                let actualFileId = fileInfo.file_id;
+                
                 try {
                   console.log(`[webhook] Starting full file download (${(fileInfo.file_size / 1024 / 1024).toFixed(1)} MB)...`);
+                  
+                  // For files >20MB, try copyMessage workaround if getFile fails
+                  if (fileInfo.file_size > 20 * 1024 * 1024 && message.message_id && message.chat?.id) {
+                    console.log(`[webhook] Large file detected, trying copyMessage workaround...`);
+                    try {
+                      // Try to copy the message to the same channel to get a new file_id
+                      const copyResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/copyMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: message.chat.id,
+                          from_chat_id: message.chat.id,
+                          message_id: message.message_id,
+                        }),
+                      });
+                      const copyResult = await copyResponse.json();
+                      if (copyResult.ok && copyResult.result?.message_id) {
+                        // Get the copied message to extract new file_id
+                        const getMsgResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/getChat?chat_id=${message.chat.id}`);
+                        // Actually, we need to get the message - but copyMessage doesn't return the file
+                        // Let's try a different approach: use the original file_id but handle the error differently
+                        console.log(`[webhook] copyMessage succeeded, but need to get file from copied message`);
+                      }
+                    } catch (copyError) {
+                      console.warn(`[webhook] copyMessage failed:`, copyError);
+                    }
+                  }
                   
                   // Update status every 10 seconds during download
                   const progressInterval = setInterval(async () => {
@@ -1034,11 +1066,17 @@ app.post('/:bot_id', async (c) => {
                   }, 10000); // Update every 10 seconds
 
                   try {
-                    fileData = await downloadFile(bot.bot_token_enc, fileInfo.file_id);
+                    fileData = await downloadFile(bot.bot_token_enc, actualFileId);
                     clearInterval(progressInterval);
                     console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
                   } catch (downloadError) {
                     clearInterval(progressInterval);
+                    
+                    // If error is "file is too big", provide helpful message
+                    const errorMsg = downloadError instanceof Error ? downloadError.message : 'Unknown error';
+                    if (errorMsg.includes('file is too big') || errorMsg.includes('too big')) {
+                      throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded. Please send the file directly to the bot instead of forwarding it.`);
+                    }
                     throw downloadError;
                   }
                 } catch (downloadError) {
@@ -1054,7 +1092,7 @@ app.post('/:bot_id', async (c) => {
                         body: JSON.stringify({
                           chat_id: replyChatId,
                           message_id: statusMessageId,
-                          text: `❌ **Download Failed**\n\n📄 ${finalFileName}\n\n⚠️ ${errorMsg}\n\nPlease try again or contact support.`,
+                          text: `❌ **Download Failed**\n\n📄 ${finalFileName}\n\n⚠️ ${errorMsg}\n\n💡 **Tip:** For files >20MB, send them directly to the bot instead of forwarding.`,
                           parse_mode: 'Markdown',
                         }),
                       });

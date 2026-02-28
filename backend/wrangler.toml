@@ -10,6 +10,14 @@ binding = "DB"
 database_name = "infinidrive-db"
 database_id = "6cb97e33-f9f2-4218-bc94-c8bb96a3e2d0"
 
+# R2 bucket for intermediate file cache (free tier: 10GB storage, 1M operations/month)
+# Note: R2 must be enabled in Cloudflare Dashboard first
+# To enable: https://dash.cloudflare.com -> R2 -> Create bucket
+# [[r2_buckets]]
+# binding = "CACHE"
+# bucket_name = "infinidrive-cache"
+# preview_bucket_name = "infinidrive-cache-preview"
+
 # Note: Cloudflare Cache API is accessed via caches.default in Workers runtime
 # No explicit binding is needed
 

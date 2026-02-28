@@ -332,6 +332,30 @@ class ApiClient {
     return this.request('/api/stats');
   }
 
+  // Status endpoints
+  async getStatusOverview() {
+    return this.request('GET', '/api/status/overview');
+  }
+
+  async getActiveUploads() {
+    return this.request('GET', '/api/status/active-uploads');
+  }
+
+  async getBotStatus() {
+    return this.request('GET', '/api/status/bots');
+  }
+
+  async getLogs(limit?: number, status?: string) {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', limit.toString());
+    if (status) params.set('status', status);
+    return this.request('GET', `/api/status/logs?${params.toString()}`);
+  }
+
+  async getFileLinks() {
+    return this.request('GET', '/api/status/files/links');
+  }
+
   // Projects
   async createProject(project_name: string, description?: string) {
     return this.request('/api/projects/create', {

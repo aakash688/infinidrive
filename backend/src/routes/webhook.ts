@@ -1056,6 +1056,33 @@ app.post('/:bot_id', async (c) => {
                 console.log(`[webhook] File forwarding status: ${isForwarded ? 'FORWARDED' : 'NOT FORWARDED (should work)'}`);
                 console.log(`[webhook] File location: storage_channel=${isStorageChannel}, from_bot_self=${isFromBotSelf}`);
                 
+                // SPECIAL CASE: If file is in storage channel and forwarded from same channel, get file_id from original message
+                if (isStorageChannel && isForwarded && message.forward_origin) {
+                  const forwardFromChatId = message.forward_origin.chat?.id?.toString();
+                  const forwardMessageId = message.forward_origin.message_id;
+                  
+                  // If forwarded from same storage channel, try to get file_id from original message
+                  if (forwardFromChatId === bot.channel_id && forwardMessageId) {
+                    console.log(`[webhook] File is forwarded within storage channel - trying to get file_id from original message ${forwardMessageId}`);
+                    
+                    try {
+                      const { getFileFromMessage } = await import('../services/telegram');
+                      const originalFile = await getFileFromMessage(bot.bot_token_enc, bot.channel_id, forwardMessageId);
+                      
+                      if (originalFile && originalFile.file_id) {
+                        console.log(`[webhook] ✅ Got file_id from original message: ${originalFile.file_id.substring(0, 30)}...`);
+                        actualFileId = originalFile.file_id;
+                        // Mark as not forwarded since we're using the original file_id
+                        // (we'll set a flag to skip forwarded checks)
+                      } else {
+                        console.warn(`[webhook] Could not get file from original message ${forwardMessageId}`);
+                      }
+                    } catch (getOriginalError) {
+                      console.warn(`[webhook] Failed to get file from original message:`, getOriginalError);
+                    }
+                  }
+                }
+                
                 // If file is in storage channel and not forwarded, it's likely from copyMessage - should work!
                 if (isStorageChannel && !isForwarded) {
                   console.log(`[webhook] ✅ File is in storage channel and NOT forwarded - this should work perfectly!`);
@@ -1146,7 +1173,11 @@ app.post('/:bot_id', async (c) => {
                   
                   // First, check if getFile will work (fail fast for large forwarded files)
                   // IMPORTANT: Files that are NOT forwarded (e.g., created by copyMessage) should work fine!
-                  console.log(`[webhook] Checking if file can be downloaded (file_id: ${actualFileId.substring(0, 30)}..., forwarded: ${isForwarded})`);
+                  // Also: If we got file_id from original message in storage channel, treat as not forwarded
+                  const isUsingOriginalFileId = actualFileId !== fileInfo.file_id;
+                  const effectiveIsForwarded = isForwarded && !isUsingOriginalFileId; // Not forwarded if we're using original file_id
+                  
+                  console.log(`[webhook] Checking if file can be downloaded (file_id: ${actualFileId.substring(0, 30)}..., forwarded: ${isForwarded}, using_original: ${isUsingOriginalFileId})`);
                   let canDownload = false;
                   try {
                     const { getFile } = await import('../services/telegram');
@@ -1154,8 +1185,8 @@ app.post('/:bot_id', async (c) => {
                     canDownload = !!testFile.file_path;
                     console.log(`[webhook] getFile check: ${canDownload ? 'OK' : 'FAILED'}, file_path: ${testFile.file_path || 'none'}`);
                     
-                    if (canDownload && !isForwarded) {
-                      console.log(`[webhook] ✅ File is NOT forwarded - should download successfully!`);
+                    if (canDownload && (!effectiveIsForwarded || isUsingOriginalFileId)) {
+                      console.log(`[webhook] ✅ File should download successfully! (using original file_id from storage channel)`);
                     }
                   } catch (getFileError) {
                     const getFileErrorMsg = getFileError instanceof Error ? getFileError.message : String(getFileError);
@@ -1164,7 +1195,7 @@ app.post('/:bot_id', async (c) => {
                     // If "file is too big" error, fail immediately with helpful message
                     // BUT: Only if file is forwarded. Non-forwarded files should work even if >20MB
                     if (getFileErrorMsg.includes('file is too big') || getFileErrorMsg.includes('too big') || getFileErrorMsg.includes('400')) {
-                      if (isForwarded) {
+                      if (effectiveIsForwarded) {
                         throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. Use a file sharing service that supports direct links`);
                       } else {
                         // Non-forwarded files >20MB might still work, but if getFile fails, show error
@@ -1175,15 +1206,15 @@ app.post('/:bot_id', async (c) => {
                     console.log(`[webhook] getFile failed but will try download anyway:`, getFileErrorMsg);
                   }
                   
-                  // Only block if file is forwarded AND >20MB AND getFile failed
+                  // Only block if file is forwarded AND >20MB AND getFile failed AND not using original file_id
                   // Non-forwarded files should be allowed to proceed
-                  if (!canDownload && isForwarded && fileInfo.file_size > 20 * 1024 * 1024) {
+                  if (!canDownload && effectiveIsForwarded && fileInfo.file_size > 20 * 1024 * 1024) {
                     throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel`);
                   }
                   
-                  // If file is NOT forwarded, proceed even if getFile check failed (might be temporary issue)
-                  if (!canDownload && !isForwarded) {
-                    console.log(`[webhook] File is NOT forwarded - proceeding with download attempt despite getFile check failure`);
+                  // If file is NOT forwarded (or using original file_id), proceed even if getFile check failed (might be temporary issue)
+                  if (!canDownload && (!effectiveIsForwarded || isUsingOriginalFileId)) {
+                    console.log(`[webhook] File is NOT forwarded (or using original file_id) - proceeding with download attempt despite getFile check failure`);
                   }
                   
                   // Update status every 10 seconds during download

@@ -748,6 +748,8 @@ app.post('/:bot_id', async (c) => {
           
           // Get storage channel (must be configured)
           const storageChannelId = bot.channel_id;
+          const sourceChatId = message.chat?.id?.toString();
+          
           if (!storageChannelId) {
             // Send error message
             if (replyChatId && statusMessageId) {
@@ -765,6 +767,13 @@ app.post('/:bot_id', async (c) => {
               } catch (e) {}
             }
             throw new Error('Bot storage channel not configured. Please configure a channel in Settings.');
+          }
+          
+          // WARNING: If storage channel is the same as source chat, files will appear in that chat
+          // This is expected behavior - the bot stores files in the configured channel
+          // If user doesn't want files to appear in the group, they should use a different storage channel
+          if (storageChannelId === sourceChatId) {
+            console.log(`[webhook] Storage channel (${storageChannelId}) is same as source chat - files will be stored in this chat`);
           }
 
           // Update file record with correct chunk count
@@ -1027,68 +1036,77 @@ app.post('/:bot_id', async (c) => {
                   
                   // For large forwarded files (>20MB), try copyMessage workaround
                   // This creates a new message with a potentially working file_id
-                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && message.message_id && message.chat?.id && bot.channel_id) {
-                    console.log(`[webhook] Large forwarded file detected, trying copyMessage workaround...`);
-                    
-                    if (replyChatId && statusMessageId) {
+                  // BUT: Only if storage channel is different from source chat (to avoid sending file back)
+                  const sourceChatId = message.chat?.id?.toString();
+                  const storageChannelId = bot.channel_id;
+                  
+                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && message.message_id && sourceChatId && storageChannelId) {
+                    // IMPORTANT: Don't copy if storage channel is the same as source chat (would send file back!)
+                    if (storageChannelId === sourceChatId) {
+                      console.log(`[webhook] Storage channel is same as source chat, skipping copyMessage to avoid sending file back`);
+                    } else {
+                      console.log(`[webhook] Large forwarded file detected, trying copyMessage workaround...`);
+                      
+                      if (replyChatId && statusMessageId) {
+                        try {
+                          await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              chat_id: replyChatId,
+                              message_id: statusMessageId,
+                              text: `🔄 **Trying workaround for large forwarded file...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Copying message to get working file_id...`,
+                              parse_mode: 'Markdown',
+                            }),
+                          });
+                        } catch (e) {}
+                      }
+                      
                       try {
-                        await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                        // Copy the forwarded message to the storage channel to get a new file_id
+                        const copyResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/copyMessage`, {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
-                            chat_id: replyChatId,
-                            message_id: statusMessageId,
-                            text: `🔄 **Trying workaround for large forwarded file...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Copying message to get working file_id...`,
-                            parse_mode: 'Markdown',
+                            chat_id: storageChannelId,
+                            from_chat_id: sourceChatId,
+                            message_id: message.message_id,
                           }),
                         });
-                      } catch (e) {}
-                    }
-                    
-                    try {
-                      // Copy the forwarded message to the storage channel to get a new file_id
-                      const copyResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/copyMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          chat_id: bot.channel_id,
-                          from_chat_id: message.chat.id.toString(),
-                          message_id: message.message_id,
-                        }),
-                      });
-                      const copyResult = await copyResponse.json();
+                        const copyResult = await copyResponse.json();
                       
-                      if (copyResult.ok && copyResult.result?.message_id) {
-                        const copiedMessageId = copyResult.result.message_id;
-                        console.log(`[webhook] copyMessage succeeded, got new message_id: ${copiedMessageId}`);
-                        
-                        // Wait a moment for Telegram to process the copy
-                        await new Promise(resolve => setTimeout(resolve, 1500));
-                        
-                        // Try to get the copied message to extract the new file_id
-                        try {
-                          // Use forwardMessage to forward the copied message to a private chat (if possible)
-                          // Or better: use the webhook update that will come for the copied message
-                          // For now, let's try to get the message using a workaround
-                          // Actually, the best approach: the copied message will trigger a new webhook update
-                          // But we can't wait for that. Instead, let's try using the original file_id
-                          // If it still fails, we'll show the error
+                        if (copyResult.ok && copyResult.result?.message_id) {
+                          const copiedMessageId = copyResult.result.message_id;
+                          console.log(`[webhook] copyMessage succeeded, got new message_id: ${copiedMessageId}`);
                           
-                          // Alternative: Try downloading using the message_id directly
-                          // But Telegram doesn't support that. We need the file_id.
+                          // Wait a moment for Telegram to process the copy
+                          await new Promise(resolve => setTimeout(resolve, 1500));
                           
-                          // For now, we'll proceed with the original file_id
-                          // The copyMessage might have created a message that we can access later
-                          // But for immediate download, we need to try the original file_id
-                          console.log(`[webhook] copyMessage created message ${copiedMessageId}, proceeding with original file_id`);
-                        } catch (getMsgError) {
-                          console.warn(`[webhook] Failed to process copied message:`, getMsgError);
+                          // Try to get the copied message to extract the new file_id
+                          try {
+                            // Use forwardMessage to forward the copied message to a private chat (if possible)
+                            // Or better: use the webhook update that will come for the copied message
+                            // For now, let's try to get the message using a workaround
+                            // Actually, the best approach: the copied message will trigger a new webhook update
+                            // But we can't wait for that. Instead, let's try using the original file_id
+                            // If it still fails, we'll show the error
+                            
+                            // Alternative: Try downloading using the message_id directly
+                            // But Telegram doesn't support that. We need the file_id.
+                            
+                            // For now, we'll proceed with the original file_id
+                            // The copyMessage might have created a message that we can access later
+                            // But for immediate download, we need to try the original file_id
+                            console.log(`[webhook] copyMessage created message ${copiedMessageId}, proceeding with original file_id`);
+                          } catch (getMsgError) {
+                            console.warn(`[webhook] Failed to process copied message:`, getMsgError);
+                          }
+                        } else {
+                          console.warn(`[webhook] copyMessage failed:`, copyResult);
                         }
-                      } else {
-                        console.warn(`[webhook] copyMessage failed:`, copyResult);
+                      } catch (copyError) {
+                        console.warn(`[webhook] copyMessage error:`, copyError);
                       }
-                    } catch (copyError) {
-                      console.warn(`[webhook] copyMessage error:`, copyError);
                     }
                   }
                   

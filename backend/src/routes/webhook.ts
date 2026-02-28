@@ -564,13 +564,31 @@ app.post('/:bot_id', async (c) => {
         // Check source (bot DM vs channel)
         const isFromBot = message.chat?.type === 'private';
         const isFromChannel = message.chat?.type === 'channel' || message.chat?.type === 'supergroup' || message.chat?.type === 'group';
+        
+        // Check if message is from the bot itself (e.g., from copyMessage)
+        const isFromBotSelf = message.from?.id === bot.telegram_bot_id;
+        const isStorageChannel = bot.channel_id && message.chat?.id?.toString() === bot.channel_id;
+        
+        console.log(`[webhook] File source check:`, {
+          isFromBot,
+          isFromChannel,
+          isFromBotSelf,
+          isStorageChannel,
+          chat_id: message.chat?.id?.toString(),
+          storage_channel_id: bot.channel_id,
+          sender_id: message.from?.id,
+          bot_id: bot.telegram_bot_id
+        });
 
-        if (isFromBot && !config.capture_from_bot) {
+        // IMPORTANT: Always process files in storage channel, even if sent by bot itself
+        // This handles files created by copyMessage workaround
+        if (isStorageChannel) {
+          console.log(`[webhook] File is in storage channel - processing regardless of sender`);
+          // Continue processing - don't skip
+        } else if (isFromBot && !config.capture_from_bot) {
           console.log(`[webhook] Capture from bot DM is disabled`);
           return c.json({ ok: true });
-        }
-
-        if (isFromChannel && !config.capture_from_channel) {
+        } else if (isFromChannel && !config.capture_from_channel) {
           console.log(`[webhook] Capture from channel is disabled`);
           return c.json({ ok: true });
         }
@@ -1030,6 +1048,18 @@ app.post('/:bot_id', async (c) => {
                 let fileData: ArrayBuffer;
                 let actualFileId = fileInfo.file_id;
                 const isForwarded = !!(message.forward_from_chat || message.forward_origin);
+                const isStorageChannel = bot.channel_id && message.chat?.id?.toString() === bot.channel_id;
+                const isFromBotSelf = message.from?.id === bot.telegram_bot_id;
+                
+                // IMPORTANT: If file is NOT forwarded (e.g., created by copyMessage), it should work fine
+                // Files without forward_from_chat/forward_origin have working file_ids
+                console.log(`[webhook] File forwarding status: ${isForwarded ? 'FORWARDED' : 'NOT FORWARDED (should work)'}`);
+                console.log(`[webhook] File location: storage_channel=${isStorageChannel}, from_bot_self=${isFromBotSelf}`);
+                
+                // If file is in storage channel and not forwarded, it's likely from copyMessage - should work!
+                if (isStorageChannel && !isForwarded) {
+                  console.log(`[webhook] ✅ File is in storage channel and NOT forwarded - this should work perfectly!`);
+                }
                 
                 // IMPORTANT: If file is NOT forwarded (e.g., created by copyMessage), it should work fine
                 // Files without forward_from_chat/forward_origin have working file_ids

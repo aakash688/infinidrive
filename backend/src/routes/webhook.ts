@@ -339,8 +339,7 @@ app.post('/:bot_id', async (c) => {
           const bots = await c.env.DB.prepare(`
             SELECT 
               bot_id, bot_username, bot_name, health_status,
-              channel_id, is_active,
-              (SELECT COUNT(*) FROM chunks WHERE bot_id = bots.bot_id) as chunks_count
+              channel_id, is_active
             FROM bots
             WHERE user_id = ?
             ORDER BY is_active DESC
@@ -351,23 +350,28 @@ app.post('/:bot_id', async (c) => {
             health_status: string;
             channel_id: string | null;
             is_active: number;
-            chunks_count: number;
           }>();
 
           let text = `🤖 **Bots Status** (${bots.results.length})\n\n`;
           for (const botInfo of bots.results) {
+            // Get chunks count separately to avoid subquery issues
+            const chunksResult = await c.env.DB.prepare(`
+              SELECT COUNT(*) as count FROM chunks WHERE bot_id = ?
+            `).bind(botInfo.bot_id).first<{ count: number }>();
+            
             const status = botInfo.is_active === 1 
               ? (botInfo.health_status === 'healthy' ? '✅' : '⚠️')
               : '❌';
-            const name = botInfo.bot_username || botInfo.bot_name || botInfo.bot_id;
+            const name = botInfo.bot_username || botInfo.bot_name || botInfo.bot_id.substring(0, 20);
             text += `${status} **${name}**\n`;
             text += `   Health: ${botInfo.health_status}\n`;
-            text += `   Chunks: ${botInfo.chunks_count}\n`;
+            text += `   Chunks: ${chunksResult?.count || 0}\n`;
             text += `   Channel: ${botInfo.channel_id ? '✅' : '❌'}\n\n`;
           }
 
           await sendMessage(text);
         } catch (error) {
+          console.error('[webhook] /bots command error:', error);
           await sendMessage('❌ Failed to get bot status. Please try again.');
         }
         return c.json({ ok: true });
@@ -994,6 +998,48 @@ app.post('/:bot_id', async (c) => {
 
                 console.log(`[webhook] Successfully processed all ${chunk_count} chunks using ${availableBots.length} bot(s) via streaming`);
               } catch (streamError) {
+                // Check if error is due to file being too large (>20MB) when forwarded
+                const streamErrorMsg = streamError instanceof Error ? streamError.message : String(streamError);
+                const isFileTooBig = streamErrorMsg.includes('file is too big') || streamErrorMsg.includes('too big');
+                const isForwarded = message.forward_from_chat || message.forward_origin;
+                
+                if (isFileTooBig && isForwarded && fileInfo.file_size > 20 * 1024 * 1024) {
+                  // File is too large and forwarded - cannot download automatically
+                  console.warn(`[webhook] Large forwarded file (>20MB) cannot be downloaded: ${finalFileName}`);
+                  
+                  if (replyChatId && statusMessageId) {
+                    try {
+                      await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: replyChatId,
+                          message_id: statusMessageId,
+                          text: `❌ **Cannot Download Large Forwarded File**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⚠️ **Telegram Limitation:**\nFiles >20MB cannot be downloaded automatically when forwarded.\n\n💡 **Solution:**\nSend the file directly to this bot instead of forwarding it.\n\n_Or download it manually and upload it via the web panel._`,
+                          parse_mode: 'Markdown',
+                        }),
+                      });
+                    } catch (e) {}
+                  }
+                  
+                  // Log as failed with helpful message
+                  const log_id = `wlog_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+                  await c.env.DB.prepare(`
+                    INSERT INTO webhook_logs (log_id, bot_id, user_id, telegram_file_id, sender_id, sender_username, sender_name, chat_id, chat_title, file_name, file_size, mime_type, caption, status, error_message, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?)
+                  `).bind(
+                    log_id, bot_id, bot.user_id, fileInfo.file_id,
+                    message.from?.id || null, message.from?.username || null, message.from?.first_name || null,
+                    message.chat?.id?.toString() || null, message.chat?.title || null,
+                    finalFileName, fileInfo.file_size, fileInfo.mime_type,
+                    message.caption || null,
+                    'File >20MB cannot be downloaded when forwarded. Send directly to bot instead.',
+                    Math.floor(Date.now() / 1000)
+                  ).run();
+                  
+                  return; // Exit early - don't try fallback download
+                }
+                
                 // Fallback: If streaming fails (e.g., getFile doesn't work), use full download approach
                 console.warn(`[webhook] Streaming approach failed, falling back to full download:`, streamError);
                 

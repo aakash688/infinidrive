@@ -181,18 +181,28 @@ app.post('/:bot_id', async (c) => {
     // HANDLE: Bot commands (text messages)
     // ==========================================
     if (update.message?.text && update.message.text.startsWith('/')) {
-      const command = update.message.text.split(' ')[0].toLowerCase();
+      // Extract command (handle both /command and /command@botname)
+      const commandText = update.message.text.split(' ')[0].toLowerCase();
+      const command = commandText.split('@')[0]; // Remove @botname if present
       const chatId = update.message.chat?.id;
       const messageId = update.message.message_id;
+      const chatType = update.message.chat?.type;
+
+      console.log(`[webhook] Command received: ${command} in ${chatType} chat ${chatId}`);
 
       if (!chatId) {
+        console.log('[webhook] No chat ID found');
         return c.json({ ok: true });
       }
+
+      // In groups, only respond if bot is mentioned or command is direct
+      // For now, we'll respond to all commands in groups (can be restricted later)
 
       // Helper to send message
       const sendMessage = async (text: string, parseMode: string = 'Markdown') => {
         try {
-          await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/sendMessage`, {
+          console.log(`[webhook] Sending command response to chat ${chatId}`);
+          const response = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -202,6 +212,12 @@ app.post('/:bot_id', async (c) => {
               reply_to_message_id: messageId,
             }),
           });
+          const result = await response.json();
+          if (!result.ok) {
+            console.error('[webhook] Telegram API error:', result);
+          } else {
+            console.log('[webhook] Command response sent successfully');
+          }
         } catch (e) {
           console.error('[webhook] Failed to send command response:', e);
         }
@@ -994,13 +1010,58 @@ app.post('/:bot_id', async (c) => {
                   } catch (e) {}
                 }
 
-                // Download full file using original method
+                // Download full file using original method with progress updates
                 let fileData: ArrayBuffer;
                 try {
-                  fileData = await downloadFile(bot.bot_token_enc, fileInfo.file_id);
-                  console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
+                  console.log(`[webhook] Starting full file download (${(fileInfo.file_size / 1024 / 1024).toFixed(1)} MB)...`);
+                  
+                  // Update status every 10 seconds during download
+                  const progressInterval = setInterval(async () => {
+                    if (replyChatId && statusMessageId) {
+                      try {
+                        await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            chat_id: replyChatId,
+                            message_id: statusMessageId,
+                            text: `⬇️ **Downloading from Telegram...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Please wait, this may take a while for large files...`,
+                            parse_mode: 'Markdown',
+                          }),
+                        });
+                      } catch (e) {}
+                    }
+                  }, 10000); // Update every 10 seconds
+
+                  try {
+                    fileData = await downloadFile(bot.bot_token_enc, fileInfo.file_id);
+                    clearInterval(progressInterval);
+                    console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
+                  } catch (downloadError) {
+                    clearInterval(progressInterval);
+                    throw downloadError;
+                  }
                 } catch (downloadError) {
-                  throw new Error(`Failed to download file: ${downloadError instanceof Error ? downloadError.message : 'Unknown error'}`);
+                  const errorMsg = downloadError instanceof Error ? downloadError.message : 'Unknown error';
+                  console.error(`[webhook] Download failed:`, errorMsg);
+                  
+                  // Update status with error
+                  if (replyChatId && statusMessageId) {
+                    try {
+                      await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: replyChatId,
+                          message_id: statusMessageId,
+                          text: `❌ **Download Failed**\n\n📄 ${finalFileName}\n\n⚠️ ${errorMsg}\n\nPlease try again or contact support.`,
+                          parse_mode: 'Markdown',
+                        }),
+                      });
+                    } catch (e) {}
+                  }
+                  
+                  throw new Error(`Failed to download file: ${errorMsg}`);
                 }
 
                 // Update status: Uploading

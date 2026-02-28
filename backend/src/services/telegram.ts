@@ -250,17 +250,36 @@ export async function downloadFile(botToken: string, fileId: string): Promise<Ar
     const url = getFileUrl(botToken, file.file_path);
     console.log(`[downloadFile] Downloading from URL: ${url.substring(0, 80)}...`);
     
-    const response = await fetch(url);
+    // Add timeout: 30 minutes for large files (918MB at 1MB/s = ~15 minutes)
+    const DOWNLOAD_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, DOWNLOAD_TIMEOUT);
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      console.error(`[downloadFile] HTTP error ${response.status}:`, errorText);
-      throw new Error(`Failed to download file from Telegram: ${response.status} ${response.statusText} - ${errorText}`);
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Unknown error');
+        console.error(`[downloadFile] HTTP error ${response.status}:`, errorText);
+        throw new Error(`Failed to download file from Telegram: ${response.status} ${response.statusText} - ${errorText}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      console.log(`[downloadFile] Successfully downloaded ${arrayBuffer.byteLength} bytes`);
+      return arrayBuffer;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Download timeout after ${DOWNLOAD_TIMEOUT / 1000 / 60} minutes. File may be too large or connection too slow.`);
+      }
+      throw error;
     }
-
-    const arrayBuffer = await response.arrayBuffer();
-    console.log(`[downloadFile] Successfully downloaded ${arrayBuffer.byteLength} bytes`);
-    return arrayBuffer;
   } catch (error) {
     console.error(`[downloadFile] Error for file_id ${fileId.substring(0, 30)}...:`, error);
     

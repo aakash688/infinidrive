@@ -564,31 +564,13 @@ app.post('/:bot_id', async (c) => {
         // Check source (bot DM vs channel)
         const isFromBot = message.chat?.type === 'private';
         const isFromChannel = message.chat?.type === 'channel' || message.chat?.type === 'supergroup' || message.chat?.type === 'group';
-        
-        // Check if message is from the bot itself (e.g., from copyMessage)
-        const isFromBotSelf = message.from?.id === bot.telegram_bot_id;
-        const isStorageChannel = bot.channel_id && message.chat?.id?.toString() === bot.channel_id;
-        
-        console.log(`[webhook] File source check:`, {
-          isFromBot,
-          isFromChannel,
-          isFromBotSelf,
-          isStorageChannel,
-          chat_id: message.chat?.id?.toString(),
-          storage_channel_id: bot.channel_id,
-          sender_id: message.from?.id,
-          bot_id: bot.telegram_bot_id
-        });
 
-        // IMPORTANT: Always process files in storage channel, even if sent by bot itself
-        // This handles files created by copyMessage workaround
-        if (isStorageChannel) {
-          console.log(`[webhook] File is in storage channel - processing regardless of sender`);
-          // Continue processing - don't skip
-        } else if (isFromBot && !config.capture_from_bot) {
+        if (isFromBot && !config.capture_from_bot) {
           console.log(`[webhook] Capture from bot DM is disabled`);
           return c.json({ ok: true });
-        } else if (isFromChannel && !config.capture_from_channel) {
+        }
+
+        if (isFromChannel && !config.capture_from_channel) {
           console.log(`[webhook] Capture from channel is disabled`);
           return c.json({ ok: true });
         }
@@ -766,8 +748,6 @@ app.post('/:bot_id', async (c) => {
           
           // Get storage channel (must be configured)
           const storageChannelId = bot.channel_id;
-          const sourceChatId = message.chat?.id?.toString();
-          
           if (!storageChannelId) {
             // Send error message
             if (replyChatId && statusMessageId) {
@@ -785,13 +765,6 @@ app.post('/:bot_id', async (c) => {
               } catch (e) {}
             }
             throw new Error('Bot storage channel not configured. Please configure a channel in Settings.');
-          }
-          
-          // WARNING: If storage channel is the same as source chat, files will appear in that chat
-          // This is expected behavior - the bot stores files in the configured channel
-          // If user doesn't want files to appear in the group, they should use a different storage channel
-          if (storageChannelId === sourceChatId) {
-            console.log(`[webhook] Storage channel (${storageChannelId}) is same as source chat - files will be stored in this chat`);
           }
 
           // Update file record with correct chunk count
@@ -1048,173 +1021,89 @@ app.post('/:bot_id', async (c) => {
                 let fileData: ArrayBuffer;
                 let actualFileId = fileInfo.file_id;
                 const isForwarded = !!(message.forward_from_chat || message.forward_origin);
-                const isStorageChannel = bot.channel_id && message.chat?.id?.toString() === bot.channel_id;
-                const isFromBotSelf = message.from?.id === bot.telegram_bot_id;
-                
-                // IMPORTANT: If file is NOT forwarded (e.g., created by copyMessage), it should work fine
-                // Files without forward_from_chat/forward_origin have working file_ids
-                console.log(`[webhook] File forwarding status: ${isForwarded ? 'FORWARDED' : 'NOT FORWARDED (should work)'}`);
-                console.log(`[webhook] File location: storage_channel=${isStorageChannel}, from_bot_self=${isFromBotSelf}`);
-                
-                // SPECIAL CASE: If file is in storage channel and forwarded from same channel, get file_id from original message
-                if (isStorageChannel && isForwarded && message.forward_origin) {
-                  const forwardFromChatId = message.forward_origin.chat?.id?.toString();
-                  const forwardMessageId = message.forward_origin.message_id;
-                  
-                  // If forwarded from same storage channel, try to get file_id from original message
-                  if (forwardFromChatId === bot.channel_id && forwardMessageId) {
-                    console.log(`[webhook] File is forwarded within storage channel - trying to get file_id from original message ${forwardMessageId}`);
-                    
-                    try {
-                      const { getFileFromMessage } = await import('../services/telegram');
-                      const originalFile = await getFileFromMessage(bot.bot_token_enc, bot.channel_id, forwardMessageId);
-                      
-                      if (originalFile && originalFile.file_id) {
-                        console.log(`[webhook] ✅ Got file_id from original message: ${originalFile.file_id.substring(0, 30)}...`);
-                        actualFileId = originalFile.file_id;
-                        // Mark as not forwarded since we're using the original file_id
-                        // (we'll set a flag to skip forwarded checks)
-                      } else {
-                        console.warn(`[webhook] Could not get file from original message ${forwardMessageId}`);
-                      }
-                    } catch (getOriginalError) {
-                      console.warn(`[webhook] Failed to get file from original message:`, getOriginalError);
-                    }
-                  }
-                }
-                
-                // If file is in storage channel and not forwarded, it's likely from copyMessage - should work!
-                if (isStorageChannel && !isForwarded) {
-                  console.log(`[webhook] ✅ File is in storage channel and NOT forwarded - this should work perfectly!`);
-                }
-                
-                // IMPORTANT: If file is NOT forwarded (e.g., created by copyMessage), it should work fine
-                // Files without forward_from_chat/forward_origin have working file_ids
-                console.log(`[webhook] File forwarding status: ${isForwarded ? 'FORWARDED' : 'NOT FORWARDED (should work)'}`);
                 
                 try {
                   console.log(`[webhook] Starting full file download (${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB)...`);
                   
                   // For large forwarded files (>20MB), try copyMessage workaround
                   // This creates a new message with a potentially working file_id
-                  // BUT: Only if storage channel is different from source chat (to avoid sending file back)
-                  const sourceChatId = message.chat?.id?.toString();
-                  const storageChannelId = bot.channel_id;
-                  
-                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && message.message_id && sourceChatId && storageChannelId) {
-                    // IMPORTANT: Don't copy if storage channel is the same as source chat (would send file back!)
-                    if (storageChannelId === sourceChatId) {
-                      console.log(`[webhook] Storage channel is same as source chat, skipping copyMessage to avoid sending file back`);
-                    } else {
-                      console.log(`[webhook] Large forwarded file detected, trying copyMessage workaround...`);
-                      
-                      if (replyChatId && statusMessageId) {
-                        try {
-                          await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                              chat_id: replyChatId,
-                              message_id: statusMessageId,
-                              text: `🔄 **Trying workaround for large forwarded file...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Copying message to get working file_id...`,
-                              parse_mode: 'Markdown',
-                            }),
-                          });
-                        } catch (e) {}
-                      }
-                      
+                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && message.message_id && message.chat?.id && bot.channel_id) {
+                    console.log(`[webhook] Large forwarded file detected, trying copyMessage workaround...`);
+                    
+                    if (replyChatId && statusMessageId) {
                       try {
-                        // Copy the forwarded message to the storage channel to get a new file_id
-                        const copyResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/copyMessage`, {
+                        await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
-                            chat_id: storageChannelId,
-                            from_chat_id: sourceChatId,
-                            message_id: message.message_id,
+                            chat_id: replyChatId,
+                            message_id: statusMessageId,
+                            text: `🔄 **Trying workaround for large forwarded file...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Copying message to get working file_id...`,
+                            parse_mode: 'Markdown',
                           }),
                         });
-                        const copyResult = await copyResponse.json();
+                      } catch (e) {}
+                    }
+                    
+                    try {
+                      // Copy the forwarded message to the storage channel to get a new file_id
+                      const copyResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/copyMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: bot.channel_id,
+                          from_chat_id: message.chat.id.toString(),
+                          message_id: message.message_id,
+                        }),
+                      });
+                      const copyResult = await copyResponse.json();
                       
-                        if (copyResult.ok && copyResult.result?.message_id) {
-                          const copiedMessageId = copyResult.result.message_id;
-                          console.log(`[webhook] copyMessage succeeded, got new message_id: ${copiedMessageId}`);
-                          
-                          // Wait a moment for Telegram to process the copy
-                          await new Promise(resolve => setTimeout(resolve, 1500));
-                          
-                          // Try to get the copied message to extract the new file_id
+                      if (copyResult.ok && copyResult.result?.message_id) {
+                        const copiedMessageId = copyResult.result.message_id;
+                        console.log(`[webhook] copyMessage succeeded, got new message_id: ${copiedMessageId}`);
+                        
+                        // The copied message will trigger a new webhook update
+                        // Since it's not forwarded, it should work normally
+                        // We'll exit this attempt and let the copied message be processed
+                        
+                        if (replyChatId && statusMessageId) {
                           try {
-                            // Use forwardMessage to forward the copied message to a private chat (if possible)
-                            // Or better: use the webhook update that will come for the copied message
-                            // For now, let's try to get the message using a workaround
-                            // Actually, the best approach: the copied message will trigger a new webhook update
-                            // But we can't wait for that. Instead, let's try using the original file_id
-                            // If it still fails, we'll show the error
-                            
-                            // Alternative: Try downloading using the message_id directly
-                            // But Telegram doesn't support that. We need the file_id.
-                            
-                            // For now, we'll proceed with the original file_id
-                            // The copyMessage might have created a message that we can access later
-                            // But for immediate download, we need to try the original file_id
-                            console.log(`[webhook] copyMessage created message ${copiedMessageId}, proceeding with original file_id`);
-                          } catch (getMsgError) {
-                            console.warn(`[webhook] Failed to process copied message:`, getMsgError);
-                          }
-                        } else {
-                          console.warn(`[webhook] copyMessage failed:`, copyResult);
+                            await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                chat_id: replyChatId,
+                                message_id: statusMessageId,
+                                text: `✅ **Copy Created Successfully**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n🔄 The copied file will be processed automatically.\n⏳ Please wait for the upload to complete...\n\n_Note: Large forwarded files require this workaround._`,
+                                parse_mode: 'Markdown',
+                              }),
+                            });
+                          } catch (e) {}
                         }
-                      } catch (copyError) {
-                        console.warn(`[webhook] copyMessage error:`, copyError);
-                      }
-                    }
-                  }
-                  
-                  // First, check if getFile will work (fail fast for large forwarded files)
-                  // IMPORTANT: Files that are NOT forwarded (e.g., created by copyMessage) should work fine!
-                  // Also: If we got file_id from original message in storage channel, treat as not forwarded
-                  const isUsingOriginalFileId = actualFileId !== fileInfo.file_id;
-                  const effectiveIsForwarded = isForwarded && !isUsingOriginalFileId; // Not forwarded if we're using original file_id
-                  
-                  console.log(`[webhook] Checking if file can be downloaded (file_id: ${actualFileId.substring(0, 30)}..., forwarded: ${isForwarded}, using_original: ${isUsingOriginalFileId})`);
-                  let canDownload = false;
-                  try {
-                    const { getFile } = await import('../services/telegram');
-                    const testFile = await getFile(bot.bot_token_enc, actualFileId);
-                    canDownload = !!testFile.file_path;
-                    console.log(`[webhook] getFile check: ${canDownload ? 'OK' : 'FAILED'}, file_path: ${testFile.file_path || 'none'}`);
-                    
-                    if (canDownload && (!effectiveIsForwarded || isUsingOriginalFileId)) {
-                      console.log(`[webhook] ✅ File should download successfully! (using original file_id from storage channel)`);
-                    }
-                  } catch (getFileError) {
-                    const getFileErrorMsg = getFileError instanceof Error ? getFileError.message : String(getFileError);
-                    console.warn(`[webhook] getFile check failed:`, getFileErrorMsg);
-                    
-                    // If "file is too big" error, fail immediately with helpful message
-                    // BUT: Only if file is forwarded. Non-forwarded files should work even if >20MB
-                    if (getFileErrorMsg.includes('file is too big') || getFileErrorMsg.includes('too big') || getFileErrorMsg.includes('400')) {
-                      if (effectiveIsForwarded) {
-                        throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. Use a file sharing service that supports direct links`);
+                        
+                        // Log as processing (the copied message will complete it)
+                        const log_id = `wlog_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+                        await c.env.DB.prepare(`
+                          INSERT INTO webhook_logs (log_id, bot_id, user_id, telegram_file_id, sender_id, sender_username, sender_name, chat_id, chat_title, file_name, file_size, mime_type, caption, status, error_message, created_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+                        `).bind(
+                          log_id, bot_id, bot.user_id, fileInfo.file_id,
+                          message.from?.id || null, message.from?.username || null, message.from?.first_name || null,
+                          message.chat?.id?.toString() || null, message.chat?.title || null,
+                          finalFileName, fileInfo.file_size, fileInfo.mime_type,
+                          message.caption || null,
+                          'Large forwarded file - copy created, waiting for webhook to process copied message',
+                          Math.floor(Date.now() / 1000)
+                        ).run();
+                        
+                        // Exit early - the copied message will be processed by webhook
+                        return;
                       } else {
-                        // Non-forwarded files >20MB might still work, but if getFile fails, show error
-                        throw new Error(`File is too large (>20MB). Telegram API limitation. Please try sending the file in smaller parts or use the web panel to upload.`);
+                        console.warn(`[webhook] copyMessage failed:`, copyResult);
                       }
+                    } catch (copyError) {
+                      console.warn(`[webhook] copyMessage error:`, copyError);
                     }
-                    // For other errors, still try to download (might be temporary)
-                    console.log(`[webhook] getFile failed but will try download anyway:`, getFileErrorMsg);
-                  }
-                  
-                  // Only block if file is forwarded AND >20MB AND getFile failed AND not using original file_id
-                  // Non-forwarded files should be allowed to proceed
-                  if (!canDownload && effectiveIsForwarded && fileInfo.file_size > 20 * 1024 * 1024) {
-                    throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel`);
-                  }
-                  
-                  // If file is NOT forwarded (or using original file_id), proceed even if getFile check failed (might be temporary issue)
-                  if (!canDownload && (!effectiveIsForwarded || isUsingOriginalFileId)) {
-                    console.log(`[webhook] File is NOT forwarded (or using original file_id) - proceeding with download attempt despite getFile check failure`);
                   }
                   
                   // Update status every 10 seconds during download
@@ -1236,18 +1125,27 @@ app.post('/:bot_id', async (c) => {
                   }, 10000); // Update every 10 seconds
 
                   try {
-                    fileData = await downloadFile(bot.bot_token_enc, actualFileId);
+                    // Add timeout wrapper for download
+                    const downloadPromise = downloadFile(bot.bot_token_enc, actualFileId);
+                    const timeoutPromise = new Promise<never>((_, reject) => {
+                      setTimeout(() => reject(new Error('Download timeout: File download took too long (>30 minutes). This usually happens with forwarded files >20MB.')), 30 * 60 * 1000);
+                    });
+                    
+                    fileData = await Promise.race([downloadPromise, timeoutPromise]);
                     clearInterval(progressInterval);
                     console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
                   } catch (downloadError) {
                     clearInterval(progressInterval);
                     
-                    // If error is "file is too big" and file is forwarded, provide helpful message
+                    // If error is "file is too big" or timeout and file is forwarded, provide helpful message
                     const errorMsg = downloadError instanceof Error ? downloadError.message : 'Unknown error';
-                    if ((errorMsg.includes('file is too big') || errorMsg.includes('too big')) && isForwarded) {
+                    const isTimeout = errorMsg.includes('timeout') || errorMsg.includes('too long');
+                    const isFileTooBig = errorMsg.includes('file is too big') || errorMsg.includes('too big');
+                    
+                    if ((isFileTooBig || isTimeout) && isForwarded) {
                       // For forwarded large files, we've already tried copyMessage workaround
                       // If that didn't work, show the limitation message
-                      throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. Use a file sharing service that supports direct links`);
+                      throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. The copied message in storage channel will be processed automatically`);
                     }
                     throw downloadError;
                   }

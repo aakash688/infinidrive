@@ -175,14 +175,30 @@ export async function sendDocument(
 /**
  * Get file information from Telegram
  */
-export async function getFile(botToken: string, fileId: string): Promise<TelegramFile> {
+export async function getFile(botToken: string, fileId: string, timeoutMs: number = 30000): Promise<TelegramFile> {
   try {
-    return await telegramRequest<TelegramFile>(botToken, 'getFile', {
+    // Add timeout wrapper for getFile call
+    const getFilePromise = telegramRequest<TelegramFile>(botToken, 'getFile', {
       file_id: fileId,
     });
+    
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`getFile timeout after ${timeoutMs}ms. File may be too large or forwarded.`)), timeoutMs);
+    });
+    
+    return await Promise.race([getFilePromise, timeoutPromise]);
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : 'Unknown error';
     console.error(`[getFile] Failed to get file with file_id ${fileId.substring(0, 30)}...:`, errorMsg);
+    
+    // Check for specific Telegram errors
+    if (errorMsg.includes('Bad Request') || errorMsg.includes('400')) {
+      if (errorMsg.includes('file is too big') || errorMsg.includes('too big')) {
+        throw new Error('File is too large (>20MB) and cannot be downloaded when forwarded. Please send the file directly to the bot.');
+      }
+      throw new Error(`Telegram API error: File cannot be accessed. ${errorMsg}`);
+    }
+    
     throw error;
   }
 }

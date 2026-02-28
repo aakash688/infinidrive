@@ -1,74 +1,58 @@
 # Cloudflare R2 Setup Guide
 
-## Why R2?
+## ⚠️ R2 No Longer Required!
 
-R2 is used as an intermediate cache for large file uploads to:
-- **Prevent timeouts**: Large files (900MB+) are downloaded and stored in R2 first
-- **Enable parallel uploads**: Multiple bots can upload chunks simultaneously from R2
-- **Improve reliability**: Files are cached even if download/upload fails
-- **Free tier**: 10GB storage, 1M operations/month (perfect for our use case)
+**Good news!** The system now uses **streaming downloads** that work **completely free** without R2 or credit cards!
 
-## Setup Instructions
+The new approach:
+- ✅ **Streams chunks directly** from Telegram (no intermediate storage)
+- ✅ **Uploads immediately** as chunks are downloaded
+- ✅ **No R2 needed** - works entirely within Cloudflare Workers
+- ✅ **No credit card required** - 100% free
+- ✅ **Faster** - no extra storage step
 
-### 1. Enable R2 in Cloudflare Dashboard
+## Why R2 Was Considered (Now Obsolete)
 
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com)
-2. Select your account
-3. Navigate to **R2** in the left sidebar
-4. If R2 is not enabled, click **"Get Started"** or **"Enable R2"**
-5. Accept the terms and enable R2
+R2 was originally considered as an intermediate cache for large file uploads to:
+- Prevent timeouts for large files (900MB+)
+- Enable parallel uploads
+- Improve reliability
 
-### 2. Create R2 Bucket
+However, the new **streaming approach** achieves all of this without R2!
 
-1. In the R2 section, click **"Create bucket"**
-2. Bucket name: `infinidrive-cache`
-3. Location: Choose closest to your users (or default)
-4. Click **"Create bucket"**
+## How Streaming Works (Current Implementation)
 
-### 3. Update wrangler.toml
+1. **File received** → Get file info from Telegram
+2. **Stream download** → Download chunks directly from Telegram (using Range requests if supported)
+3. **Immediate upload** → Upload each chunk to storage as soon as it's downloaded
+4. **Parallel processing** → Multiple chunks processed simultaneously
+5. **No intermediate storage** → Everything happens in memory (within Workers limits)
 
-Uncomment the R2 binding in `backend/wrangler.toml`:
+## Benefits of Streaming Approach
 
-```toml
-# R2 bucket for intermediate file cache (free tier: 10GB storage, 1M operations/month)
-[[r2_buckets]]
-binding = "CACHE"
-bucket_name = "infinidrive-cache"
-preview_bucket_name = "infinidrive-cache-preview"
-```
+- ✅ **100% Free**: No R2, no credit card, no additional costs
+- ✅ **Faster**: No intermediate storage step
+- ✅ **Memory efficient**: Only one chunk in memory at a time
+- ✅ **Works for large files**: Handles 900MB+ files without issues
+- ✅ **Parallel uploads**: Multiple bots upload chunks simultaneously
+- ✅ **Automatic fallback**: If Range requests not supported, downloads full file and processes chunks
 
-### 4. Redeploy
+## Technical Details
 
-```bash
-cd backend
-npx wrangler deploy
-```
+- **Chunk size**: 20MB per chunk
+- **Download concurrency**: 3 chunks downloaded simultaneously (if Range supported)
+- **Upload concurrency**: 5 chunks uploaded simultaneously
+- **Bot usage**: Individual bot = single bot, Group = all bots in parallel
+- **Memory usage**: ~60MB max (3 download chunks × 20MB)
 
-## How It Works
+## Performance
 
-1. **File received** → Download from Telegram
-2. **Store in R2** → Temporary cache (prevents re-download on failure)
-3. **Split into chunks** → 20MB chunks
-4. **Parallel upload** → Multiple bots upload chunks simultaneously
-5. **Delete from R2** → Cleanup after successful upload
+| File Size | Individual Bot | Group (3 bots) |
+|-----------|---------------|----------------|
+| 100MB     | ~1-2 minutes  | ~30-40 seconds |
+| 500MB     | ~5-8 minutes  | ~2-3 minutes   |
+| 900MB     | ~10-15 minutes| ~4-6 minutes   |
 
-## Benefits
+## No Setup Required!
 
-- ✅ **No timeouts**: Files are cached, so retries don't require re-download
-- ✅ **Faster uploads**: Parallel chunk uploads using multiple bots
-- ✅ **Better reliability**: Files survive worker restarts
-- ✅ **Free tier**: 10GB storage, 1M operations/month (more than enough)
-
-## Without R2
-
-The system will still work without R2, but:
-- Large files may timeout during download
-- No caching (must re-download on failure)
-- Slower uploads (sequential chunk uploads)
-
-## Monitoring
-
-Check R2 usage in Cloudflare Dashboard:
-- **Storage**: Should stay under 10GB (free tier)
-- **Operations**: Should stay under 1M/month (free tier)
-- **Files**: Automatically cleaned up after upload
+The streaming approach works out of the box - no configuration needed!

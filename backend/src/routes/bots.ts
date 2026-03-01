@@ -120,7 +120,7 @@ app.post('/add', async (c) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url: webhookUrl,
-          allowed_updates: ['message', 'chat_member'],
+          allowed_updates: ['message', 'channel_post', 'chat_member'],
         }),
       });
       
@@ -291,6 +291,69 @@ app.delete('/:bot_id', async (c) => {
       error: 'Failed to remove bot',
       message: error instanceof Error ? error.message : 'Unknown error'
     }, 500);
+  }
+});
+
+/**
+ * POST /api/bots/fix-webhooks
+ * Re-register webhooks for ALL user's bots with correct allowed_updates
+ * This fixes bots that were added before channel_post was included
+ */
+app.post('/fix-webhooks', async (c) => {
+  try {
+    const user = c.get('user');
+
+    const bots = await c.env.DB.prepare(`
+      SELECT bot_id, bot_token_enc, bot_username
+      FROM bots
+      WHERE user_id = ? AND is_active = 1
+    `).bind(user.user_id).all<{
+      bot_id: string;
+      bot_token_enc: string;
+      bot_username: string | null;
+    }>();
+
+    const baseUrl = c.req.url.includes('localhost')
+      ? 'http://localhost:8787'
+      : 'https://infinidrive-backend.infinidrive.workers.dev';
+
+    const results: Array<{ bot_id: string; bot_username: string | null; success: boolean; error?: string }> = [];
+
+    for (const bot of bots.results) {
+      try {
+        const webhookUrl = `${baseUrl}/api/webhook/${bot.bot_id}`;
+        const response = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/setWebhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: webhookUrl,
+            allowed_updates: ['message', 'channel_post', 'chat_member'],
+          }),
+        });
+        const result: any = await response.json();
+        results.push({
+          bot_id: bot.bot_id,
+          bot_username: bot.bot_username,
+          success: result.ok === true,
+          error: result.ok ? undefined : result.description,
+        });
+      } catch (err) {
+        results.push({
+          bot_id: bot.bot_id,
+          bot_username: bot.bot_username,
+          success: false,
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+      }
+    }
+
+    return c.json({
+      message: `Re-registered webhooks for ${results.filter(r => r.success).length}/${bots.results.length} bots`,
+      results,
+    });
+  } catch (error) {
+    console.error('Fix webhooks error:', error);
+    return c.json({ error: 'Failed to fix webhooks' }, 500);
   }
 });
 

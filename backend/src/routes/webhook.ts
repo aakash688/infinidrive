@@ -13,6 +13,9 @@ type Env = {
 
 const app = new Hono<{ Bindings: Env }>();
 
+// IMPORTANT: Define chunk size at module level - avoids TDZ (Temporal Dead Zone) errors
+const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB chunks
+
 // Helper: Extract file info from a Telegram message
 function extractFileInfo(message: any): {
   file_id: string;
@@ -625,15 +628,6 @@ app.post('/:bot_id', async (c) => {
           return c.json({ ok: true });
         }
 
-        // IMPORTANT: Check if message is from storage channel itself
-        // If it is, it's a copy we created - process it normally (don't try copyMessage again)
-        const isFromStorageChannel = bot.channel_id && 
-          message.chat?.id?.toString() === bot.channel_id.toString();
-        
-        if (isFromStorageChannel) {
-          console.log(`[webhook] Message is from storage channel - treating as direct upload (not forwarded)`);
-        }
-
         // ==========================================
         // PROCESS THE FILE - Create file + chunk records
         // ==========================================
@@ -686,35 +680,10 @@ app.post('/:bot_id', async (c) => {
             }
           }
 
-          // Check if there's already a file record for this file_unique_id
-          // This happens when: original forwarded message created a file record, then copyMessage created a copy
-          // We want to reuse the existing file_id instead of creating a duplicate
-          let file_id: string;
-          let existingFile = await c.env.DB.prepare(
-            'SELECT file_id, chunk_count FROM files WHERE user_id = ? AND file_hash = ? AND is_deleted = 0'
-          ).bind(bot.user_id, fileInfo.file_unique_id).first<{ file_id: string; chunk_count: number }>();
-          
+          // Create file record
+          const file_id = `file_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
           const now = Math.floor(Date.now() / 1000);
-          
-          if (existingFile && isFromStorageChannel) {
-            // Reuse existing file record from the original forwarded message attempt
-            file_id = existingFile.file_id;
-            console.log(`[webhook] Reusing existing file record for copied message: ${file_id}`);
-            
-            // Update the file record with correct chunk_count
-            const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
-            await c.env.DB.prepare(`
-              UPDATE files SET 
-                chunk_count = ?,
-                file_size = ?,
-                updated_at = ?
-              WHERE file_id = ?
-            `).bind(chunk_count, fileInfo.file_size, now, file_id).run();
-          } else {
-            // Create new file record
-            file_id = `file_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-          }
-          
+          const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
           const file_path = folder_path === '/' ? `/${fileInfo.file_name}` : `${folder_path}/${fileInfo.file_name}`;
 
           // Source info (who sent it)
@@ -738,22 +707,18 @@ app.post('/:bot_id', async (c) => {
             }
           }
 
-          if (!existingFile || !isFromStorageChannel) {
-            // Only insert if we're not reusing an existing file
-            const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
-            await c.env.DB.prepare(`
-              INSERT INTO files (
-                file_id, user_id, folder_id, file_name, file_path, file_size,
-                mime_type, file_hash, chunk_count, is_encrypted, is_public,
-                source, source_info, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'webhook', ?, ?, ?)
-            `).bind(
-              file_id, bot.user_id, target_folder_id || null,
-              finalFileName, file_path, fileInfo.file_size,
-              fileInfo.mime_type, fileInfo.file_unique_id, // Use unique_id as hash
-              chunk_count, sourceInfo, now, now
-            ).run();
-          }
+          await c.env.DB.prepare(`
+            INSERT INTO files (
+              file_id, user_id, folder_id, file_name, file_path, file_size,
+              mime_type, file_hash, chunk_count, is_encrypted, is_public,
+              source, source_info, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'webhook', ?, ?, ?)
+          `).bind(
+            file_id, bot.user_id, target_folder_id || null,
+            finalFileName, file_path, fileInfo.file_size,
+            fileInfo.mime_type, fileInfo.file_unique_id,
+            chunk_count, sourceInfo, now, now
+          ).run();
 
           // ==========================================
           // SEND IMMEDIATE ACKNOWLEDGMENT
@@ -791,9 +756,6 @@ app.post('/:bot_id', async (c) => {
           // ==========================================
           // PROCESS FILE ASYNCHRONOUSLY (Background)
           // ==========================================
-          const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB chunks
-          const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
-          
           // Get storage channel (must be configured)
           const storageChannelId = bot.channel_id;
           if (!storageChannelId) {
@@ -814,11 +776,6 @@ app.post('/:bot_id', async (c) => {
             }
             throw new Error('Bot storage channel not configured. Please configure a channel in Settings.');
           }
-
-          // Update file record with correct chunk count
-          await c.env.DB.prepare(`
-            UPDATE files SET chunk_count = ? WHERE file_id = ?
-          `).bind(chunk_count, file_id).run();
 
           // Determine bot usage strategy
           // Individual bot (private chat): Use only that bot
@@ -1068,157 +1025,18 @@ app.post('/:bot_id', async (c) => {
                   } catch (e) {}
                 }
 
-                // Download full file using original method with progress updates
-                // For large forwarded files (>20MB), try copyMessage workaround
+                // FALLBACK: Full file download approach
+                // Telegram Bot API has a HARD 20MB limit on getFile downloads
+                // Files >20MB simply CANNOT be downloaded via Bot API
                 let fileData: ArrayBuffer;
-                let actualFileId = fileInfo.file_id;
                 
-                // Check if message is forwarded, BUT ignore if it's from storage channel (it's a copy we created)
-                const isForwarded = !isFromStorageChannel && !!(message.forward_from_chat || message.forward_origin);
-                
-                try {
-                  console.log(`[webhook] Starting full file download (${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB)...`);
-                  console.log(`[webhook] File info: isForwarded=${isForwarded}, isFromStorageChannel=${isFromStorageChannel}`);
+                // Check if file exceeds Telegram Bot API download limit
+                if (fileInfo.file_size > 20 * 1024 * 1024) {
+                  console.error(`[webhook] File exceeds 20MB Telegram Bot API limit: ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB`);
                   
-                  // For large forwarded files (>20MB), try copyMessage workaround
-                  // BUT: Skip if message is from storage channel (it's already a copy we created)
-                  // This creates a new message with a potentially working file_id
-                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && !isFromStorageChannel && message.message_id && message.chat?.id && bot.channel_id) {
-                    console.log(`[webhook] Large forwarded file detected, trying copyMessage workaround...`);
-                    
-                    if (replyChatId && statusMessageId) {
-                      try {
-                        await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({
-                            chat_id: replyChatId,
-                            message_id: statusMessageId,
-                            text: `🔄 **Trying workaround for large forwarded file...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Copying message to get working file_id...`,
-                            parse_mode: 'Markdown',
-                          }),
-                        });
-                      } catch (e) {}
-                    }
-                    
-                    try {
-                      // Copy the forwarded message to the storage channel to get a new file_id
-                      const copyResponse = await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/copyMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          chat_id: bot.channel_id,
-                          from_chat_id: message.chat.id.toString(),
-                          message_id: message.message_id,
-                        }),
-                      });
-                      const copyResult = await copyResponse.json();
-                      
-                      if (copyResult.ok && copyResult.result?.message_id) {
-                        const copiedMessageId = copyResult.result.message_id;
-                        console.log(`[webhook] copyMessage succeeded, got new message_id: ${copiedMessageId}`);
-                        
-                        // IMPORTANT: Delete the file record we just created, since the copied message will create its own
-                        // The copied message will trigger a new webhook update and create a proper file record
-                        try {
-                          await c.env.DB.prepare(`DELETE FROM files WHERE file_id = ?`).bind(file_id).run();
-                          console.log(`[webhook] Deleted incomplete file record ${file_id}, copied message will create a new one`);
-                        } catch (deleteError) {
-                          console.warn(`[webhook] Failed to delete incomplete file record:`, deleteError);
-                        }
-                        
-                        // The copied message will trigger a new webhook update
-                        // Since it's not forwarded, it should work normally
-                        // We'll exit this attempt and let the copied message be processed
-                        
-                        if (replyChatId && statusMessageId) {
-                          try {
-                            await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({
-                                chat_id: replyChatId,
-                                message_id: statusMessageId,
-                                text: `✅ **Copy Created Successfully**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n🔄 The copied file will be processed automatically.\n⏳ Please wait for the upload to complete...\n\n_Note: Large forwarded files require this workaround._`,
-                                parse_mode: 'Markdown',
-                              }),
-                            });
-                          } catch (e) {}
-                        }
-                        
-                        // Log as processing (the copied message will complete it)
-                        const log_id = `wlog_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-                        await c.env.DB.prepare(`
-                          INSERT INTO webhook_logs (log_id, bot_id, user_id, telegram_file_id, sender_id, sender_username, sender_name, chat_id, chat_title, file_name, file_size, mime_type, caption, status, error_message, created_at)
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)
-                        `).bind(
-                          log_id, bot_id, bot.user_id, fileInfo.file_id,
-                          message.from?.id || null, message.from?.username || null, message.from?.first_name || null,
-                          message.chat?.id?.toString() || null, message.chat?.title || null,
-                          finalFileName, fileInfo.file_size, fileInfo.mime_type,
-                          message.caption || null,
-                          'Large forwarded file - copy created, waiting for webhook to process copied message',
-                          Math.floor(Date.now() / 1000)
-                        ).run();
-                        
-                        // Exit early - the copied message will be processed by webhook
-                        return;
-                      } else {
-                        console.warn(`[webhook] copyMessage failed:`, copyResult);
-                      }
-                    } catch (copyError) {
-                      console.warn(`[webhook] copyMessage error:`, copyError);
-                    }
-                  }
+                  const sizeStr = `${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB`;
+                  const errorText = `❌ **File Too Large for Bot API**\n\n📄 ${finalFileName}\n📦 ${sizeStr}\n\n⚠️ **Telegram Limitation:**\nThe Bot API can only download files up to 20MB.\nThis file is ${sizeStr}.\n\n💡 **How to upload large files:**\n1. Download the file to your device\n2. Go to infinidrive-web.pages.dev\n3. Upload it directly via the web panel\n\n_This is a Telegram Bot API limitation, not an InfiniDrive limitation._`;
                   
-                  // Update status every 10 seconds during download
-                  const progressInterval = setInterval(async () => {
-                    if (replyChatId && statusMessageId) {
-                      try {
-                        await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({
-                            chat_id: replyChatId,
-                            message_id: statusMessageId,
-                            text: `⬇️ **Downloading from Telegram...**\n\n📄 ${finalFileName}\n📦 ${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB\n\n⏳ Please wait, this may take a while for large files...`,
-                            parse_mode: 'Markdown',
-                          }),
-                        });
-                      } catch (e) {}
-                    }
-                  }, 10000); // Update every 10 seconds
-
-                  try {
-                    // Add timeout wrapper for download
-                    const downloadPromise = downloadFile(bot.bot_token_enc, actualFileId);
-                    const timeoutPromise = new Promise<never>((_, reject) => {
-                      setTimeout(() => reject(new Error('Download timeout: File download took too long (>30 minutes). This usually happens with forwarded files >20MB.')), 30 * 60 * 1000);
-                    });
-                    
-                    fileData = await Promise.race([downloadPromise, timeoutPromise]);
-                    clearInterval(progressInterval);
-                    console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
-                  } catch (downloadError) {
-                    clearInterval(progressInterval);
-                    
-                    // If error is "file is too big" or timeout and file is forwarded, provide helpful message
-                    const errorMsg = downloadError instanceof Error ? downloadError.message : 'Unknown error';
-                    const isTimeout = errorMsg.includes('timeout') || errorMsg.includes('too long');
-                    const isFileTooBig = errorMsg.includes('file is too big') || errorMsg.includes('too big');
-                    
-                    if ((isFileTooBig || isTimeout) && isForwarded) {
-                      // For forwarded large files, we've already tried copyMessage workaround
-                      // If that didn't work, show the limitation message
-                      throw new Error(`File is too large (>20MB) and cannot be downloaded automatically when forwarded.\n\n💡 **Solutions:**\n1. Send the file directly to this bot (not forward)\n2. Download manually and upload via web panel\n3. The copied message in storage channel will be processed automatically`);
-                    }
-                    throw downloadError;
-                  }
-                } catch (downloadError) {
-                  const errorMsg = downloadError instanceof Error ? downloadError.message : 'Unknown error';
-                  console.error(`[webhook] Download failed:`, errorMsg);
-                  
-                  // Update status with error
                   if (replyChatId && statusMessageId) {
                     try {
                       await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
@@ -1227,7 +1045,39 @@ app.post('/:bot_id', async (c) => {
                         body: JSON.stringify({
                           chat_id: replyChatId,
                           message_id: statusMessageId,
-                          text: `❌ **Download Failed**\n\n📄 ${finalFileName}\n\n⚠️ ${errorMsg}\n\n💡 **Tip:** For files >20MB, send them directly to the bot instead of forwarding.`,
+                          text: errorText,
+                          parse_mode: 'Markdown',
+                        }),
+                      });
+                    } catch (e) {}
+                  }
+                  
+                  throw new Error(`File exceeds 20MB Telegram Bot API download limit (${sizeStr})`);
+                }
+                
+                try {
+                  console.log(`[webhook] Starting full file download (${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB)...`);
+                  
+                  const downloadPromise = downloadFile(bot.bot_token_enc, fileInfo.file_id);
+                  const timeoutPromise = new Promise<never>((_, reject) => {
+                    setTimeout(() => reject(new Error('Download timeout after 5 minutes')), 5 * 60 * 1000);
+                  });
+                  
+                  fileData = await Promise.race([downloadPromise, timeoutPromise]);
+                  console.log(`[webhook] Downloaded ${fileData.byteLength} bytes using fallback method`);
+                } catch (downloadError) {
+                  const errorMsg = downloadError instanceof Error ? downloadError.message : 'Unknown error';
+                  console.error(`[webhook] Download failed:`, errorMsg);
+                  
+                  if (replyChatId && statusMessageId) {
+                    try {
+                      await fetch(`https://api.telegram.org/bot${bot.bot_token_enc}/editMessageText`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: replyChatId,
+                          message_id: statusMessageId,
+                          text: `❌ **Download Failed**\n\n📄 ${finalFileName}\n\n⚠️ ${errorMsg}`,
                           parse_mode: 'Markdown',
                         }),
                       });

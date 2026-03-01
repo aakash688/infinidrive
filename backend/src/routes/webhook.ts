@@ -596,6 +596,15 @@ app.post('/:bot_id', async (c) => {
           return c.json({ ok: true });
         }
 
+        // IMPORTANT: Check if message is from storage channel itself
+        // If it is, it's a copy we created - process it normally (don't try copyMessage again)
+        const isFromStorageChannel = bot.channel_id && 
+          message.chat?.id?.toString() === bot.channel_id.toString();
+        
+        if (isFromStorageChannel) {
+          console.log(`[webhook] Message is from storage channel - treating as direct upload (not forwarded)`);
+        }
+
         // Check file size limit
         if (config.max_file_size > 0 && fileInfo.file_size > config.max_file_size) {
           console.log(`[webhook] File too large: ${fileInfo.file_size} > ${config.max_file_size}`);
@@ -614,6 +623,15 @@ app.post('/:bot_id', async (c) => {
           ).run();
 
           return c.json({ ok: true });
+        }
+
+        // IMPORTANT: Check if message is from storage channel itself
+        // If it is, it's a copy we created - process it normally (don't try copyMessage again)
+        const isFromStorageChannel = bot.channel_id && 
+          message.chat?.id?.toString() === bot.channel_id.toString();
+        
+        if (isFromStorageChannel) {
+          console.log(`[webhook] Message is from storage channel - treating as direct upload (not forwarded)`);
         }
 
         // ==========================================
@@ -668,9 +686,35 @@ app.post('/:bot_id', async (c) => {
             }
           }
 
-          // Create file record
-          const file_id = `file_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+          // Check if there's already a file record for this file_unique_id
+          // This happens when: original forwarded message created a file record, then copyMessage created a copy
+          // We want to reuse the existing file_id instead of creating a duplicate
+          let file_id: string;
+          let existingFile = await c.env.DB.prepare(
+            'SELECT file_id, chunk_count FROM files WHERE user_id = ? AND file_hash = ? AND is_deleted = 0'
+          ).bind(bot.user_id, fileInfo.file_unique_id).first<{ file_id: string; chunk_count: number }>();
+          
           const now = Math.floor(Date.now() / 1000);
+          
+          if (existingFile && isFromStorageChannel) {
+            // Reuse existing file record from the original forwarded message attempt
+            file_id = existingFile.file_id;
+            console.log(`[webhook] Reusing existing file record for copied message: ${file_id}`);
+            
+            // Update the file record with correct chunk_count
+            const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
+            await c.env.DB.prepare(`
+              UPDATE files SET 
+                chunk_count = ?,
+                file_size = ?,
+                updated_at = ?
+              WHERE file_id = ?
+            `).bind(chunk_count, fileInfo.file_size, now, file_id).run();
+          } else {
+            // Create new file record
+            file_id = `file_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+          }
+          
           const file_path = folder_path === '/' ? `/${fileInfo.file_name}` : `${folder_path}/${fileInfo.file_name}`;
 
           // Source info (who sent it)
@@ -694,18 +738,22 @@ app.post('/:bot_id', async (c) => {
             }
           }
 
-          await c.env.DB.prepare(`
-            INSERT INTO files (
-              file_id, user_id, folder_id, file_name, file_path, file_size,
-              mime_type, file_hash, chunk_count, is_encrypted, is_public,
-              source, source_info, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'webhook', ?, ?, ?)
-          `).bind(
-            file_id, bot.user_id, target_folder_id || null,
-            finalFileName, file_path, fileInfo.file_size,
-            fileInfo.mime_type, fileInfo.file_unique_id, // Use unique_id as hash
-            sourceInfo, now, now
-          ).run();
+          if (!existingFile || !isFromStorageChannel) {
+            // Only insert if we're not reusing an existing file
+            const chunk_count = Math.ceil(fileInfo.file_size / CHUNK_SIZE);
+            await c.env.DB.prepare(`
+              INSERT INTO files (
+                file_id, user_id, folder_id, file_name, file_path, file_size,
+                mime_type, file_hash, chunk_count, is_encrypted, is_public,
+                source, source_info, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'webhook', ?, ?, ?)
+            `).bind(
+              file_id, bot.user_id, target_folder_id || null,
+              finalFileName, file_path, fileInfo.file_size,
+              fileInfo.mime_type, fileInfo.file_unique_id, // Use unique_id as hash
+              chunk_count, sourceInfo, now, now
+            ).run();
+          }
 
           // ==========================================
           // SEND IMMEDIATE ACKNOWLEDGMENT
@@ -880,7 +928,11 @@ app.post('/:bot_id', async (c) => {
               let failedChunks = 0;
 
               // Try streaming approach first, fallback to full download if it fails
+              // IMPORTANT: For messages from storage channel (copied messages), the file_id should work
+              // But we still need to handle potential failures gracefully
               try {
+                console.log(`[webhook] Attempting streaming download for file_id: ${fileInfo.file_id}, isFromStorageChannel: ${isFromStorageChannel}`);
+                
                 // Stream download and upload chunks in parallel
                 await streamDownloadFile(
                   bot.bot_token_enc,
@@ -1020,14 +1072,18 @@ app.post('/:bot_id', async (c) => {
                 // For large forwarded files (>20MB), try copyMessage workaround
                 let fileData: ArrayBuffer;
                 let actualFileId = fileInfo.file_id;
-                const isForwarded = !!(message.forward_from_chat || message.forward_origin);
+                
+                // Check if message is forwarded, BUT ignore if it's from storage channel (it's a copy we created)
+                const isForwarded = !isFromStorageChannel && !!(message.forward_from_chat || message.forward_origin);
                 
                 try {
                   console.log(`[webhook] Starting full file download (${(fileInfo.file_size / (1024 * 1024)).toFixed(1)} MB)...`);
+                  console.log(`[webhook] File info: isForwarded=${isForwarded}, isFromStorageChannel=${isFromStorageChannel}`);
                   
                   // For large forwarded files (>20MB), try copyMessage workaround
+                  // BUT: Skip if message is from storage channel (it's already a copy we created)
                   // This creates a new message with a potentially working file_id
-                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && message.message_id && message.chat?.id && bot.channel_id) {
+                  if (fileInfo.file_size > 20 * 1024 * 1024 && isForwarded && !isFromStorageChannel && message.message_id && message.chat?.id && bot.channel_id) {
                     console.log(`[webhook] Large forwarded file detected, trying copyMessage workaround...`);
                     
                     if (replyChatId && statusMessageId) {
@@ -1061,6 +1117,15 @@ app.post('/:bot_id', async (c) => {
                       if (copyResult.ok && copyResult.result?.message_id) {
                         const copiedMessageId = copyResult.result.message_id;
                         console.log(`[webhook] copyMessage succeeded, got new message_id: ${copiedMessageId}`);
+                        
+                        // IMPORTANT: Delete the file record we just created, since the copied message will create its own
+                        // The copied message will trigger a new webhook update and create a proper file record
+                        try {
+                          await c.env.DB.prepare(`DELETE FROM files WHERE file_id = ?`).bind(file_id).run();
+                          console.log(`[webhook] Deleted incomplete file record ${file_id}, copied message will create a new one`);
+                        } catch (deleteError) {
+                          console.warn(`[webhook] Failed to delete incomplete file record:`, deleteError);
+                        }
                         
                         // The copied message will trigger a new webhook update
                         // Since it's not forwarded, it should work normally
